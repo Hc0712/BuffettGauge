@@ -75,7 +75,8 @@ SHILLER_URLS = [
 SHILLER_DISCOVERY_PAGE = "https://shillerdata.com/"
 CMC_BERKSHIRE_TOTAL_ASSETS_URL = "https://companiesmarketcap.com/berkshire-hathaway/total-assets/"
 CMC_BERKSHIRE_CASH_ON_HAND_URL = "https://companiesmarketcap.com/berkshire-hathaway/cash-on-hand/"
-DEFAULT_START = "1950-01-01"
+DEFAULT_START = "1989-01-01"
+MIN_DISPLAY_START = "1989-01-01"
 DEFAULT_OUTPUT_HTML = "buffett_dashboard.html"
 DEFAULT_OUTPUT_XLSX = "buffett_dashboard.xlsx"
 STDDEV_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0)
@@ -758,13 +759,20 @@ def build_buffett_series(session: requests.Session, start: str) -> pd.DataFrame:
 
 
 def build_shiller_series(session: requests.Session, start: str) -> pd.DataFrame:
-    """Build the Shiller CAPE / S&P history plus expanded standard-deviation levels."""
+    """Build the Shiller CAPE / S&P history plus requested standard-deviation levels.
+
+    The updated dashboard needs both series in the same figure panels, so this
+    builder now precomputes the constant historical mean +/- standard deviation
+    bands for *both* the CAPE ratio and the S&P 500 index. Keeping the derived
+    columns here makes the plotting code much cleaner and ensures the Excel
+    workbook receives the same reference levels used by the chart.
+    """
     shiller = fetch_shiller_workbook(session)
     shiller = shiller[shiller["date"] >= pd.Timestamp(start)].copy()
     shiller = shiller.rename(columns={"sp500_shiller": "sp500_index", "cape": "shiller_cape"})
 
-    # Preserve the existing CAPE mean/+/-1sd columns for backward compatibility
-    # while also adding the newly requested +/-0.5, +/-1.5, and +/-2.0 levels.
+    # Constant historical CAPE mean and +/-0.5, +/-1.0, +/-1.5, +/-2.0 sigma
+    # guide levels used in the combined top panel.
     shiller = add_stddev_level_columns(
         shiller,
         source_col="shiller_cape",
@@ -772,7 +780,18 @@ def build_shiller_series(session: requests.Session, start: str) -> pd.DataFrame:
         include_mean=True,
         floor_at_zero=True,
     )
+
+    # Constant historical S&P 500 mean and +/-0.5, +/-1.0, +/-1.5, +/-2.0 sigma
+    # guide levels used in the updated middle panel.
+    shiller = add_stddev_level_columns(
+        shiller,
+        source_col="sp500_index",
+        prefix="sp500",
+        include_mean=True,
+        floor_at_zero=True,
+    )
     return shiller.reset_index(drop=True)
+
 
 
 def build_combined_monthly_sheet(
@@ -842,53 +861,97 @@ def add_grouped_trace(fig: go.Figure, trace: go.BaseTraceType, row: int, col: in
     fig.add_trace(trace, row=row, col=col, secondary_y=secondary_y)
 
 
+def _make_year_axis_settings(start_date: pd.Timestamp) -> dict:
+    """Return a reusable Plotly x-axis configuration with yearly grid lines.
+
+    The dashboard uses monthly data, but the requested presentation should mark
+    each calendar year explicitly on the top and middle charts. Returning the
+    settings as a dictionary keeps the row-specific axis updates concise while
+    ensuring every visible x-axis uses the same tick spacing, solid yearly grid
+    lines, and readable year labels.
+    """
+    if pd.isna(start_date):
+        start_date = pd.Timestamp(DEFAULT_START)
+    year_start = pd.Timestamp(year=start_date.year, month=1, day=1)
+    return {
+        "title_text": "Year",
+        "tickformat": "%Y",
+        "dtick": "M12",
+        "tick0": year_start,
+        "showticklabels": True,
+        "showgrid": True,
+        "gridcolor": "rgba(120, 120, 120, 0.45)",
+        "griddash": "solid",
+        "gridwidth": 1.0,
+        "showline": True,
+        "linecolor": "rgba(70, 70, 70, 0.80)",
+        "ticks": "outside",
+        "rangeslider_visible": False,
+    }
+
+
 def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd.DataFrame) -> go.Figure:
-    """Create the three-panel Plotly dashboard.
+    """Create the three-panel Plotly dashboard with the requested styling fixes.
 
-    Panel 1: Buffett indicator + log-linear trend + +/-1 and +/-2 sigma bands
-    Panel 2: Shiller CAPE (left axis) + S&P index (right axis)
-    Panel 3: Berkshire cash on hand and total assets as grouped bars
-
-    v5 chart note:
-    - the bottom panel now plots *cash* and *total assets* as bars on the same
-      USD axis instead of plotting cash plus cash/assets % as two separate bars
-    - each hover label still shows the existing cash/assets percentage so users
-      can inspect the ratio without seeing it as a standalone series
+    The updated figure intentionally:
+    - shows year labels and solid yearly vertical grid lines on the shared time
+      axis so the top and middle panels are easier to read;
+    - colors the y-axis titles/tick labels to match their underlying series;
+    - limits the middle-panel guide bands to the Buffett Indicator only; and
+    - removes the duplicated Berkshire cash/assets ratio from the unified hover.
     """
     fig = make_subplots(
         rows=3,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.05,
-        row_heights=[0.42, 0.30, 0.28],
-        specs=[[{}], [{"secondary_y": True}], [{}]],
+        row_heights=[0.40, 0.32, 0.28],
+        specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{}]],
         subplot_titles=(
-            "Buffett Indicator with historical trend and standard-deviation bands",
-            "S&P 500 index and Shiller CAPE ratio",
+            "Buffett Indicator and Shiller CAPE ratio",
+            "S&P 500 index and Buffett Indicator",
             "Berkshire Hathaway cash on hand and total assets (CompaniesMarketCap source)",
         ),
     )
 
-    # --- Panel 1: Buffett indicator ---
+    # Requested band styling: keep Buffett guide bands clearly red and CAPE
+    # guide bands clearly green, while using progressively lighter shades so the
+    # outer/inner levels remain visually distinct without overpowering the main
+    # series. The lighter shades read like softer grey levels against a white
+    # background while still preserving the requested red/green identity.
+    buffett_band_colors = {
+        "buffett_trend_plus_2sd": "rgba(214, 39, 40, 0.95)",
+        "buffett_trend_plus_1sd": "rgba(214, 39, 40, 0.75)",
+        "buffett_trend_minus_1sd": "rgba(214, 39, 40, 0.55)",
+        "buffett_trend_minus_2sd": "rgba(214, 39, 40, 0.35)",
+    }
+    cape_band_colors = {
+        "cape_plus_2sd": "rgba(44, 160, 44, 0.95)",
+        "cape_plus_1sd": "rgba(44, 160, 44, 0.75)",
+        "cape_minus_1sd": "rgba(44, 160, 44, 0.55)",
+        "cape_minus_2sd": "rgba(44, 160, 44, 0.35)",
+    }
+
+    # --- Panel 1: Buffett Indicator + CAPE (dual axis) ---
     add_grouped_trace(
         fig,
         go.Scatter(
             x=buffett["date"],
             y=buffett["buffett_index_pct"],
             mode="lines",
-            name="Buffett Index",
+            name="Buffett Indicator",
             legendgroup="buffett",
-            line=dict(color="#1f77b4", width=2.0),
-            hovertemplate="%{x|%Y-%m}<br>Buffett Index: %{y:.2f}%<extra></extra>",
+            line=dict(color="#d62728", width=3.2),
+            hovertemplate="%{x|%Y-%m}<br>Buffett Indicator: %{y:.2f}%<extra></extra>",
         ),
         row=1,
+        secondary_y=False,
     )
-    for ycol, label, color, dash in [
-        ("buffett_trend", "Trend", "#7f7f7f", "dash"),
-        ("buffett_trend_plus_1sd", "+1 Std Dev", "#ff7f0e", "dot"),
-        ("buffett_trend_plus_2sd", "+2 Std Dev", "#d62728", "dot"),
-        ("buffett_trend_minus_1sd", "-1 Std Dev", "#8bc34a", "dot"),
-        ("buffett_trend_minus_2sd", "-2 Std Dev", "#2ca02c", "dot"),
+    for ycol, label in [
+        ("buffett_trend_plus_2sd", "Buffett +2 Std Dev"),
+        ("buffett_trend_plus_1sd", "Buffett +1 Std Dev"),
+        ("buffett_trend_minus_1sd", "Buffett -1 Std Dev"),
+        ("buffett_trend_minus_2sd", "Buffett -2 Std Dev"),
     ]:
         add_grouped_trace(
             fig,
@@ -899,31 +962,32 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
                 name=label,
                 legendgroup="buffett",
                 showlegend=False,
-                line=dict(color=color, width=1.3, dash=dash),
+                line=dict(color=buffett_band_colors[ycol], width=1.5, dash="dash"),
                 hovertemplate=f"%{{x|%Y-%m}}<br>{label}: %{{y:.2f}}%<extra></extra>",
             ),
             row=1,
+            secondary_y=False,
         )
 
-    # --- Panel 2: CAPE + S&P ---
     add_grouped_trace(
         fig,
         go.Scatter(
             x=shiller["date"],
             y=shiller["shiller_cape"],
             mode="lines",
-            name="S&P 500 Shiller CAPE Ratio",
+            name="Shiller CAPE Ratio",
             legendgroup="cape",
-            line=dict(color="#2563eb", width=2.0),
-            hovertemplate="%{x|%Y-%m}<br>CAPE: %{y:.2f}<extra></extra>",
+            line=dict(color="#2ca02c", width=3.2),
+            hovertemplate="%{x|%Y-%m}<br>Shiller CAPE Ratio: %{y:.2f}<extra></extra>",
         ),
-        row=2,
-        secondary_y=False,
+        row=1,
+        secondary_y=True,
     )
-    for ycol, label, color in [
-        ("cape_mean", "CAPE Mean", "#475569"),
-        ("cape_plus_1sd", "CAPE +1 Std Dev", "#60a5fa"),
-        ("cape_minus_1sd", "CAPE -1 Std Dev", "#60a5fa"),
+    for ycol, label in [
+        ("cape_plus_2sd", "CAPE +2 Std Dev"),
+        ("cape_plus_1sd", "CAPE +1 Std Dev"),
+        ("cape_minus_1sd", "CAPE -1 Std Dev"),
+        ("cape_minus_2sd", "CAPE -2 Std Dev"),
     ]:
         add_grouped_trace(
             fig,
@@ -934,29 +998,67 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
                 name=label,
                 legendgroup="cape",
                 showlegend=False,
-                line=dict(color=color, width=1.2, dash="dash"),
+                line=dict(color=cape_band_colors[ycol], width=1.5, dash="dash"),
                 hovertemplate=f"%{{x|%Y-%m}}<br>{label}: %{{y:.2f}}<extra></extra>",
             ),
-            row=2,
-            secondary_y=False,
+            row=1,
+            secondary_y=True,
         )
 
+    # --- Panel 2: S&P 500 + Buffett Indicator (dual axis) ---
     add_grouped_trace(
         fig,
         go.Scatter(
             x=shiller["date"],
             y=shiller["sp500_index"],
             mode="lines",
-            name="S&P Index",
+            name="S&P 500 Index",
             legendgroup="spx",
-            line=dict(color="#111827", width=1.8),
-            hovertemplate="%{x|%Y-%m}<br>S&P Index: %{y:,.2f}<extra></extra>",
+            line=dict(color="#1f77b4", width=3.2),
+            hovertemplate="%{x|%Y-%m}<br>S&P 500 Index: %{y:,.2f}<extra></extra>",
+        ),
+        row=2,
+        secondary_y=False,
+    )
+
+    add_grouped_trace(
+        fig,
+        go.Scatter(
+            x=buffett["date"],
+            y=buffett["buffett_index_pct"],
+            mode="lines",
+            name="Buffett Indicator (Middle Panel)",
+            legendgroup="buffett_mid",
+            line=dict(color="#d62728", width=3.2),
+            hovertemplate="%{x|%Y-%m}<br>Buffett Indicator: %{y:.2f}%<extra></extra>",
         ),
         row=2,
         secondary_y=True,
     )
+    for ycol, label in [
+        ("buffett_trend_plus_2sd", "Buffett +2 Std Dev (Middle Panel)"),
+        ("buffett_trend_plus_1sd", "Buffett +1 Std Dev (Middle Panel)"),
+        ("buffett_trend_minus_1sd", "Buffett -1 Std Dev (Middle Panel)"),
+        ("buffett_trend_minus_2sd", "Buffett -2 Std Dev (Middle Panel)"),
+    ]:
+        clean_label = label.replace(" (Middle Panel)", "")
+        add_grouped_trace(
+            fig,
+            go.Scatter(
+                x=buffett["date"],
+                y=buffett[ycol],
+                mode="lines",
+                name=label,
+                legendgroup="buffett_mid",
+                showlegend=False,
+                line=dict(color=buffett_band_colors[ycol], width=1.5, dash="dash"),
+                hovertemplate=f"%{{x|%Y-%m}}<br>{clean_label}: %{{y:.2f}}%<extra></extra>",
+            ),
+            row=2,
+            secondary_y=True,
+        )
 
-    # --- Panel 3: Berkshire grouped bars with ratio in hover ---
+    # --- Panel 3: Berkshire grouped bars with a single ratio in unified hover ---
     hover_ratio = brk["brk_cash_to_assets_pct"].map(lambda x: "N/A" if pd.isna(x) else f"{x:.2f}%")
 
     add_grouped_trace(
@@ -968,8 +1070,7 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
             legendgroup="brk_cash",
             marker_color="#10b981",
             opacity=0.82,
-            customdata=np.column_stack([hover_ratio]),
-            hovertemplate="%{x|%Y-%m-%d}<br>Cash: %{y:,.2f} B USD<br>Cash / Assets: %{customdata[0]}<extra></extra>",
+            hovertemplate="%{x|%Y-%m-%d}<br>Cash: %{y:,.2f} B USD<extra></extra>",
         ),
         row=3,
         secondary_y=False,
@@ -990,23 +1091,77 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         secondary_y=False,
     )
 
-    fig.update_yaxes(title_text="Percent of GDP (%)", row=1, col=1)
-    fig.update_yaxes(title_text="CAPE Ratio", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="S&P 500 Index", row=2, col=1, secondary_y=True)
+    sp500_max = float(shiller["sp500_index"].max()) if not shiller.empty else 10000.0
+    sp500_axis_max = max(10000, int(math.ceil(sp500_max / 1000.0) * 1000.0))
+    sp500_gridvals = list(range(1000, 10001, 1000))
+
+    all_dates = pd.concat(
+        [
+            buffett[["date"]].rename(columns={"date": "date"}),
+            shiller[["date"]].rename(columns={"date": "date"}),
+            brk[["date"]].rename(columns={"date": "date"}),
+        ],
+        ignore_index=True,
+    )
+    first_date = pd.to_datetime(all_dates["date"], errors="coerce").dropna().min()
+    year_axis_settings = _make_year_axis_settings(first_date)
+
+    fig.update_yaxes(
+        title_text="Buffett Indicator (% of GDP)",
+        row=1,
+        col=1,
+        secondary_y=False,
+        title_font=dict(color="#d62728"),
+        tickfont=dict(color="#d62728"),
+    )
+    fig.update_yaxes(
+        title_text="Shiller CAPE Ratio",
+        row=1,
+        col=1,
+        secondary_y=True,
+        title_font=dict(color="#2ca02c"),
+        tickfont=dict(color="#2ca02c"),
+    )
+    fig.update_yaxes(
+        title_text="S&P 500 Index",
+        row=2,
+        col=1,
+        secondary_y=False,
+        tickmode="array",
+        tickvals=sp500_gridvals,
+        ticktext=[f"{value:,}" for value in sp500_gridvals],
+        range=[0, sp500_axis_max],
+        showgrid=True,
+        gridcolor="rgba(128, 128, 128, 0.50)",
+        griddash="solid",
+        gridwidth=1.0,
+        zeroline=False,
+        title_font=dict(color="#1f77b4"),
+        tickfont=dict(color="#1f77b4"),
+    )
+    fig.update_yaxes(
+        title_text="Buffett Indicator (% of GDP)",
+        row=2,
+        col=1,
+        secondary_y=True,
+        title_font=dict(color="#d62728"),
+        tickfont=dict(color="#d62728"),
+    )
     fig.update_yaxes(title_text="USD billions", row=3, col=1)
 
+    for row in (1, 2, 3):
+        fig.update_xaxes(row=row, col=1, **year_axis_settings)
+
     fig.update_layout(
-        title="Buffett Indicator dashboard with Shiller CAPE, S&P 500, and Berkshire cash/assets overlays (v5)",
+        title="Buffett Indicator dashboard with combined Buffett/CAPE and S&P/Buffett panels",
         template="plotly_white",
         hovermode="x unified",
         barmode="group",
-        height=1100,
+        height=1120,
         legend=dict(title="Click legend items to switch each output on/off", groupclick="togglegroup"),
-        margin=dict(l=60, r=40, t=80, b=50),
+        margin=dict(l=70, r=70, t=80, b=50),
     )
-    fig.update_xaxes(title_text="Date", row=3, col=1, rangeslider_visible=False)
     return fig
-
 
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1222,9 @@ def main() -> None:
     session = make_http_session(args.user_agent)
     started_at = time.perf_counter()
 
-    start = pd.Timestamp(args.start).strftime("%Y-%m-%d")
+    requested_start = pd.Timestamp(args.start)
+    enforced_cutoff = pd.Timestamp(MIN_DISPLAY_START)
+    start = max(requested_start, enforced_cutoff).strftime("%Y-%m-%d")
     log_progress("Starting dashboard build", started_at)
 
     log_progress("Downloading Buffett Indicator inputs (Yahoo/FRED)", started_at)
@@ -1101,7 +1258,7 @@ def main() -> None:
     brk = brk_bundle.merged.copy()
     log_progress(f"Berkshire merged dataset ready with {len(brk):,} rows", started_at)
 
-    # Apply the user-selected start date consistently across all exported sheets.
+    # Apply the enforced 1989-01 minimum cutoff consistently across all exported sheets.
     cutoff = pd.Timestamp(start)
     buffett = buffett[buffett["date"] >= cutoff].copy()
     shiller = shiller[shiller["date"] >= cutoff].copy()
