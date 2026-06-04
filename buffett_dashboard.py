@@ -864,17 +864,16 @@ def add_grouped_trace(fig: go.Figure, trace: go.BaseTraceType, row: int, col: in
 def _make_year_axis_settings(start_date: pd.Timestamp) -> dict:
     """Return a reusable Plotly x-axis configuration with yearly grid lines.
 
-    The dashboard uses monthly data, but the requested presentation should mark
-    each calendar year explicitly on the top and middle charts. Returning the
-    settings as a dictionary keeps the row-specific axis updates concise while
-    ensuring every visible x-axis uses the same tick spacing, solid yearly grid
-    lines, and readable year labels.
+    The centered Plotly x-axis title is intentionally disabled.  The dashboard
+    adds a custom bold black ``Year`` annotation at the far right of each panel
+    so the label sits to the right of the latest visible year instead of below
+    the middle of the axis.
     """
     if pd.isna(start_date):
         start_date = pd.Timestamp(DEFAULT_START)
     year_start = pd.Timestamp(year=start_date.year, month=1, day=1)
     return {
-        "title_text": "Year",
+        "title_text": "",
         "tickformat": "%Y",
         "dtick": "M12",
         "tick0": year_start,
@@ -886,26 +885,53 @@ def _make_year_axis_settings(start_date: pd.Timestamp) -> dict:
         "showline": True,
         "linecolor": "rgba(70, 70, 70, 0.80)",
         "ticks": "outside",
+        "tickfont": dict(color="black"),
         "rangeslider_visible": False,
     }
 
 
-def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd.DataFrame) -> go.Figure:
-    """Create the three-panel Plotly dashboard with the requested styling fixes.
+def latest_complete_month_end(as_of: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    """Return the latest completed month-end for monthly market data.
 
-    The updated figure intentionally:
-    - shows year labels and solid yearly vertical grid lines on the shared time
-      axis so the top and middle panels are easier to read;
-    - colors the y-axis titles/tick labels to match their underlying series;
-    - limits the middle-panel guide bands to the Buffett Indicator only; and
-    - removes the duplicated Berkshire cash/assets ratio from the unified hover.
+    Example: when the dashboard is run on 2026-06-04, June is still incomplete,
+    so the latest complete S&P 500 month-end must be 2026-05-31.
     """
+    as_of_ts = pd.Timestamp.today().normalize() if as_of is None else pd.Timestamp(as_of).normalize()
+    if as_of_ts.is_month_end:
+        return as_of_ts
+    return (as_of_ts.to_period("M") - 1).to_timestamp(how="end").normalize()
+
+
+def build_dashboard_figure(
+    buffett: pd.DataFrame,
+    shiller: pd.DataFrame,
+    brk: pd.DataFrame,
+    sp500_yahoo: Optional[pd.DataFrame] = None,
+) -> go.Figure:
+    """Create the three-panel Plotly dashboard with the requested graph fixes.
+
+    Fixes included:
+    - larger vertical spacing between the three panels;
+    - custom bold black ``Year`` labels placed next to the latest year tick;
+    - extra right-side plotting room so standard-deviation labels and right y-axes do not collide;
+    - the middle-panel S&P 500 line uses the dedicated Yahoo series so it
+      continues past the Shiller workbook cutoff; and
+    - the Berkshire bar hover puts the year and Cash / Assets (%) at the top.
+    """
+    if sp500_yahoo is None or sp500_yahoo.empty:
+        sp500_plot = shiller[["date", "sp500_index"]].rename(columns={"sp500_index": "sp500_yahoo"}).copy()
+    else:
+        sp500_plot = sp500_yahoo[["date", "sp500_yahoo"]].copy()
+    sp500_plot["date"] = pd.to_datetime(sp500_plot["date"], errors="coerce")
+    sp500_plot["sp500_yahoo"] = pd.to_numeric(sp500_plot["sp500_yahoo"], errors="coerce")
+    sp500_plot = sp500_plot.dropna(subset=["date", "sp500_yahoo"]).sort_values("date")
+
     fig = make_subplots(
         rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.40, 0.32, 0.28],
+        vertical_spacing=0.10,
+        row_heights=[0.38, 0.32, 0.30],
         specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{}]],
         subplot_titles=(
             "Buffett Indicator and Shiller CAPE ratio",
@@ -914,11 +940,6 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         ),
     )
 
-    # Requested band styling: keep Buffett guide bands clearly red and CAPE
-    # guide bands clearly green, while using progressively lighter shades so the
-    # outer/inner levels remain visually distinct without overpowering the main
-    # series. The lighter shades read like softer grey levels against a white
-    # background while still preserving the requested red/green identity.
     buffett_band_colors = {
         "buffett_trend_plus_2sd": "rgba(214, 39, 40, 0.95)",
         "buffett_trend_plus_1sd": "rgba(214, 39, 40, 0.75)",
@@ -931,6 +952,19 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         "cape_minus_1sd": "rgba(44, 160, 44, 0.55)",
         "cape_minus_2sd": "rgba(44, 160, 44, 0.35)",
     }
+
+    buffett_band_specs = [
+        ("buffett_trend_plus_2sd", "+2 Std Dev"),
+        ("buffett_trend_plus_1sd", "+1 Std Dev"),
+        ("buffett_trend_minus_1sd", "-1 Std Dev"),
+        ("buffett_trend_minus_2sd", "-2 Std Dev"),
+    ]
+    cape_band_specs = [
+        ("cape_plus_2sd", "+2 Std Dev"),
+        ("cape_plus_1sd", "+1 Std Dev"),
+        ("cape_minus_1sd", "-1 Std Dev"),
+        ("cape_minus_2sd", "-2 Std Dev"),
+    ]
 
     # --- Panel 1: Buffett Indicator + CAPE (dual axis) ---
     add_grouped_trace(
@@ -947,12 +981,8 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         row=1,
         secondary_y=False,
     )
-    for ycol, label in [
-        ("buffett_trend_plus_2sd", "Buffett +2 Std Dev"),
-        ("buffett_trend_plus_1sd", "Buffett +1 Std Dev"),
-        ("buffett_trend_minus_1sd", "Buffett -1 Std Dev"),
-        ("buffett_trend_minus_2sd", "Buffett -2 Std Dev"),
-    ]:
+    for ycol, short_label in buffett_band_specs:
+        label = f"Buffett {short_label}"
         add_grouped_trace(
             fig,
             go.Scatter(
@@ -983,12 +1013,8 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         row=1,
         secondary_y=True,
     )
-    for ycol, label in [
-        ("cape_plus_2sd", "CAPE +2 Std Dev"),
-        ("cape_plus_1sd", "CAPE +1 Std Dev"),
-        ("cape_minus_1sd", "CAPE -1 Std Dev"),
-        ("cape_minus_2sd", "CAPE -2 Std Dev"),
-    ]:
+    for ycol, short_label in cape_band_specs:
+        label = f"CAPE {short_label}"
         add_grouped_trace(
             fig,
             go.Scatter(
@@ -1009,8 +1035,8 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
     add_grouped_trace(
         fig,
         go.Scatter(
-            x=shiller["date"],
-            y=shiller["sp500_index"],
+            x=sp500_plot["date"],
+            y=sp500_plot["sp500_yahoo"],
             mode="lines",
             name="S&P 500 Index",
             legendgroup="spx",
@@ -1035,12 +1061,8 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         row=2,
         secondary_y=True,
     )
-    for ycol, label in [
-        ("buffett_trend_plus_2sd", "Buffett +2 Std Dev (Middle Panel)"),
-        ("buffett_trend_plus_1sd", "Buffett +1 Std Dev (Middle Panel)"),
-        ("buffett_trend_minus_1sd", "Buffett -1 Std Dev (Middle Panel)"),
-        ("buffett_trend_minus_2sd", "Buffett -2 Std Dev (Middle Panel)"),
-    ]:
+    for ycol, short_label in buffett_band_specs:
+        label = f"Buffett {short_label} (Middle Panel)"
         clean_label = label.replace(" (Middle Panel)", "")
         add_grouped_trace(
             fig,
@@ -1058,8 +1080,37 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
             secondary_y=True,
         )
 
-    # --- Panel 3: Berkshire grouped bars with a single ratio in unified hover ---
+    # --- Panel 3: Berkshire grouped bars ---
+    # A single invisible hover carrier prevents duplicated year rows in unified hover.
+    # The visible bars keep the legend and visual encoding, but do not emit hover rows.
+    # The unified hover title remains the single year; the body starts with Cash / Assets (%).
     hover_ratio = brk["brk_cash_to_assets_pct"].map(lambda x: "N/A" if pd.isna(x) else f"{x:.2f}%")
+    hover_cash = (brk["brk_cash_usd"] / 1_000_000_000.0).map(lambda x: "N/A" if pd.isna(x) else f"{x:,.2f} B USD")
+    hover_assets = (brk["brk_total_assets_usd"] / 1_000_000_000.0).map(lambda x: "N/A" if pd.isna(x) else f"{x:,.2f} B USD")
+    brk_customdata = np.column_stack([hover_cash, hover_assets, hover_ratio])
+
+    add_grouped_trace(
+        fig,
+        go.Scatter(
+            x=brk["date"],
+            y=brk["brk_total_assets_usd"] / 1_000_000_000.0,
+            mode="markers",
+            name="Berkshire hover details",
+            showlegend=False,
+            marker=dict(size=28, color="rgba(0,0,0,0)"),
+            customdata=brk_customdata,
+            hovertemplate=(
+                "<b>Cash / Assets (%) : %{customdata[2]}</b>"
+                "<br><br><span style='color:#10b981'>■</span> "
+                "<b><span style='color:#10b981'>Cash: %{customdata[0]}</span></b>"
+                "<br><br><span style='color:#f59e0b'>■</span> "
+                "<b><span style='color:#f59e0b'>Total Assets: %{customdata[1]}</span></b>"
+                "<extra></extra>"
+            ),
+        ),
+        row=3,
+        secondary_y=False,
+    )
 
     add_grouped_trace(
         fig,
@@ -1070,7 +1121,8 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
             legendgroup="brk_cash",
             marker_color="#10b981",
             opacity=0.82,
-            hovertemplate="%{x|%Y-%m-%d}<br>Cash: %{y:,.2f} B USD<extra></extra>",
+            hoverinfo="skip",
+            hovertemplate=None,
         ),
         row=3,
         secondary_y=False,
@@ -1084,35 +1136,45 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
             legendgroup="brk_assets",
             marker_color="#f59e0b",
             opacity=0.70,
-            customdata=np.column_stack([hover_ratio]),
-            hovertemplate="%{x|%Y-%m-%d}<br>Total Assets: %{y:,.2f} B USD<br>Cash / Assets: %{customdata[0]}<extra></extra>",
+            hoverinfo="skip",
+            hovertemplate=None,
         ),
         row=3,
         secondary_y=False,
     )
 
-    sp500_max = float(shiller["sp500_index"].max()) if not shiller.empty else 10000.0
+    sp500_max = float(sp500_plot["sp500_yahoo"].max()) if not sp500_plot.empty else 10000.0
     sp500_axis_max = max(10000, int(math.ceil(sp500_max / 1000.0) * 1000.0))
-    sp500_gridvals = list(range(1000, 10001, 1000))
+    sp500_gridvals = list(range(1000, sp500_axis_max + 1, 1000))
 
     all_dates = pd.concat(
         [
             buffett[["date"]].rename(columns={"date": "date"}),
             shiller[["date"]].rename(columns={"date": "date"}),
+            sp500_plot[["date"]].rename(columns={"date": "date"}),
             brk[["date"]].rename(columns={"date": "date"}),
         ],
         ignore_index=True,
     )
-    first_date = pd.to_datetime(all_dates["date"], errors="coerce").dropna().min()
+    clean_dates = pd.to_datetime(all_dates["date"], errors="coerce").dropna()
+    first_date = clean_dates.min()
+    last_data_date = clean_dates.max()
+    # Keep generous right-side whitespace for Std Dev labels before the right-side y-axis text.
+    # This also extends the horizontal grid lines to the right.
+    label_right_date = (last_data_date + pd.DateOffset(months=28)).normalize()
+    x_title_date = (last_data_date + pd.DateOffset(months=6)).normalize()
     year_axis_settings = _make_year_axis_settings(first_date)
+    year_axis_settings["range"] = [first_date, label_right_date]
 
     fig.update_yaxes(
-        title_text="Buffett Indicator (% of GDP)",
+        title_text="Buffett Indicator(Stock Market Value/GDP)",
         row=1,
         col=1,
         secondary_y=False,
         title_font=dict(color="#d62728"),
         tickfont=dict(color="#d62728"),
+        automargin=True,
+        title_standoff=34,
     )
     fig.update_yaxes(
         title_text="Shiller CAPE Ratio",
@@ -1121,6 +1183,8 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         secondary_y=True,
         title_font=dict(color="#2ca02c"),
         tickfont=dict(color="#2ca02c"),
+        automargin=True,
+        title_standoff=34,
     )
     fig.update_yaxes(
         title_text="S&P 500 Index",
@@ -1138,16 +1202,20 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         zeroline=False,
         title_font=dict(color="#1f77b4"),
         tickfont=dict(color="#1f77b4"),
+        automargin=True,
+        title_standoff=34,
     )
     fig.update_yaxes(
-        title_text="Buffett Indicator (% of GDP)",
+        title_text="Buffett Indicator(Stock Market Value/GDP)",
         row=2,
         col=1,
         secondary_y=True,
         title_font=dict(color="#d62728"),
         tickfont=dict(color="#d62728"),
+        automargin=True,
+        title_standoff=34,
     )
-    fig.update_yaxes(title_text="USD billions", row=3, col=1)
+    fig.update_yaxes(title_text="USD billions", row=3, col=1, automargin=True, title_standoff=34)
 
     for row in (1, 2, 3):
         fig.update_xaxes(row=row, col=1, **year_axis_settings)
@@ -1156,11 +1224,74 @@ def build_dashboard_figure(buffett: pd.DataFrame, shiller: pd.DataFrame, brk: pd
         title="Buffett Indicator dashboard with combined Buffett/CAPE and S&P/Buffett panels",
         template="plotly_white",
         hovermode="x unified",
+        hoverlabel=dict(font=dict(color="black")),
         barmode="group",
-        height=1120,
+        height=1320,
         legend=dict(title="Click legend items to switch each output on/off", groupclick="togglegroup"),
-        margin=dict(l=70, r=70, t=80, b=50),
+        margin=dict(l=70, r=340, t=90, b=70),
     )
+
+    def _last_valid_point(df: pd.DataFrame, ycol: str) -> tuple[pd.Timestamp, float] | None:
+        work = df[["date", ycol]].copy()
+        work["date"] = pd.to_datetime(work["date"], errors="coerce")
+        work[ycol] = pd.to_numeric(work[ycol], errors="coerce")
+        work = work.dropna(subset=["date", ycol]).sort_values("date")
+        if work.empty:
+            return None
+        row = work.iloc[-1]
+        return pd.Timestamp(row["date"]), float(row[ycol])
+
+    def _add_line_end_label(
+        df: pd.DataFrame,
+        ycol: str,
+        label: str,
+        color: str,
+        yref: str,
+        x_month_offset: int = 4,
+        yshift: int = 0,
+    ) -> None:
+        point = _last_valid_point(df, ycol)
+        if point is None:
+            return
+        x_value, y_value = point
+        fig.add_annotation(
+            x=x_value + pd.DateOffset(months=x_month_offset),
+            y=y_value,
+            xref="x",
+            yref=yref,
+            text=f"<b>{label}</b>",
+            showarrow=False,
+            xanchor="left",
+            yanchor="middle",
+            font=dict(color=color, size=11),
+            bgcolor="rgba(255,255,255,0.70)",
+            borderpad=1,
+            yshift=yshift,
+        )
+
+    # Label all plotted standard-deviation guide lines at their right endpoints.
+    for ycol, short_label in buffett_band_specs:
+        _add_line_end_label(buffett, ycol, short_label, buffett_band_colors[ycol], yref="y", yshift=0)
+    for ycol, short_label in cape_band_specs:
+        _add_line_end_label(shiller, ycol, short_label, cape_band_colors[ycol], yref="y2", yshift=0)
+    for ycol, short_label in buffett_band_specs:
+        _add_line_end_label(buffett, ycol, short_label, buffett_band_colors[ycol], yref="y4", yshift=0)
+
+    # Custom x-axis titles, one per panel, positioned just to the right of the latest visible year.
+    for axis_name in ("yaxis", "yaxis3", "yaxis5"):
+        domain = getattr(fig.layout, axis_name).domain
+        fig.add_annotation(
+            x=x_title_date,
+            y=max(domain[0] - 0.025, 0.01),
+            xref="x",
+            yref="paper",
+            text="<b>Year</b>",
+            showarrow=False,
+            xanchor="left",
+            yanchor="top",
+            font=dict(color="black", size=12),
+        )
+
     return fig
 
 
@@ -1231,17 +1362,23 @@ def main() -> None:
     buffett = build_buffett_series(session, start)
     log_progress(f"Buffett dataset ready with {len(buffett):,} rows", started_at)
 
+    latest_sp500_month_end = latest_complete_month_end()
+    log_progress(f"Latest completed S&P 500 month-end cutoff: {latest_sp500_month_end:%Y-%m-%d}", started_at)
+
     log_progress("Downloading Shiller workbook and calculating CAPE series", started_at)
     shiller = build_shiller_series(session, start)
+    shiller = shiller[shiller["date"] <= latest_sp500_month_end].copy()
     log_progress(f"Shiller dataset ready with {len(shiller):,} rows", started_at)
 
     log_progress("Downloading dedicated Yahoo S&P 500 monthly series for Excel", started_at)
     try:
         sp500_yahoo = fetch_yahoo_history("^GSPC", start=start, interval="1mo").rename(columns={"value": "sp500_yahoo"})
+        sp500_yahoo = sp500_yahoo[sp500_yahoo["date"] <= latest_sp500_month_end].copy()
         log_progress(f"Yahoo S&P dataset ready with {len(sp500_yahoo):,} rows", started_at)
     except Exception as exc:
         log_progress(f"Yahoo S&P download failed ({exc}); falling back to Shiller S&P column", started_at)
         sp500_yahoo = shiller[["date", "sp500_index"]].rename(columns={"sp500_index": "sp500_yahoo"}).copy()
+        sp500_yahoo = sp500_yahoo[sp500_yahoo["date"] <= latest_sp500_month_end].copy()
 
     # Add the requested historical mean +/- standard-deviation levels directly
     # in the dedicated S&P worksheet before the workbook is written.
@@ -1277,7 +1414,7 @@ def main() -> None:
     log_progress(f"Combined sheet ready with {len(combined):,} rows", started_at)
 
     log_progress("Rendering Plotly dashboard", started_at)
-    figure = build_dashboard_figure(buffett=buffett, shiller=shiller, brk=brk)
+    figure = build_dashboard_figure(buffett=buffett, shiller=shiller, brk=brk, sp500_yahoo=sp500_yahoo)
 
     html_path = output_dir / args.html_name
     excel_path = output_dir / args.excel_name
