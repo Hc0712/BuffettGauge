@@ -39,6 +39,32 @@ Interactive Plotly dashboard with:
 - Legend-based series toggles.
 - Custom standard-deviation controls for switching raw/log bands and line counts.
 
+
+## HTML dashboard UI preview
+
+The generated `buffett_dashboard.html` is an interactive Plotly dashboard. The page combines long-term valuation indicators, market index history, Berkshire Hathaway liquidity data, and browser-side controls for showing or hiding statistical reference lines.
+
+### Full dashboard view
+
+![Main dashboard UI](UI_setting.png)
+
+The full dashboard view shows the custom **Std line controls** panel at the top, followed by the main chart area. The first chart panel compares the **Buffett Indicator** with the **Shiller CAPE ratio** and their standard-deviation reference lines. The legend on the right can be clicked to show or hide each output series.
+
+### Lower chart panels and hover annotation
+
+![Dashboard chart panels](UI_main.png)
+
+The lower dashboard panels show the **S&P 500 index and Buffett Indicator** together, plus **Berkshire Hathaway cash on hand and total assets** as bar charts. When users hover over a data point or bar, the dashboard displays contextual values such as year, cash/assets percentage, cash amount, and total assets.
+
+### Brief UI introduction
+
+- **Std line controls** — switch CAPE, Buffett Indicator, and S&P 500 standard-deviation bands between `Raw` and `Log` modes.
+- **On/Off buttons** — show or hide each group of standard-deviation lines without regenerating the dashboard.
+- **Std line count** — choose between `4 lines` for a cleaner view or `8 lines` for more granular valuation bands.
+- **Legend** — click a series name to show or hide it in the chart.
+- **Hover labels** — move the mouse over lines or bars to inspect exact values by year/date.
+- **Zoom and pan** — use Plotly's built-in interactions to inspect specific historical periods.
+
 ### `buffett_dashboard.xlsx`
 
 Excel workbook containing native-frequency and merged data sheets:
@@ -53,18 +79,85 @@ Excel workbook containing native-frequency and merged data sheets:
 - `Combined`
 
 ## Requirements
+### Python 3.10 or newer is recommended. Python 3.9 is the minimum expected version.
 
-- Python 3.10+ recommended.
-- Internet access.
-- A descriptive HTTP user agent, preferably with contact information.
+### Automatically install libraries with step0_install.bat
+The Users normally need to install additional Python libraries before running this script.
 
-Install the Python dependencies:
+The script uses standard-library modules such as `argparse`, `io`, `json`, `math`, `os`, `re`, `time`, `urllib`, `dataclasses`, `pathlib`, and `typing`. Those come with Python and do **not** need separate installation.
+
+It also imports third-party packages that usually must be installed with `pip`:
+
+- `numpy`
+- `pandas`
+- `plotly`
+- `requests`
+- `yfinance`
+- `openpyxl`
+- `xlrd`
+
 
 ```bash
 pip install numpy pandas plotly requests yfinance openpyxl xlrd
 ```
 
-> `xlrd` is used for reading older Excel workbooks such as Shiller's `.xls` file. `openpyxl` is used for writing the generated `.xlsx` workbook.
+If your system has multiple Python versions, use:
+
+```bash
+python -m pip install numpy pandas plotly requests yfinance openpyxl xlrd
+```
+
+or:
+
+```bash
+python3 -m pip install numpy pandas plotly requests yfinance openpyxl xlrd
+```
+
+### Why these packages are needed
+
+- `numpy` — numerical calculations and standard-deviation band calculations.
+- `pandas` — data cleaning, merging, date handling, CSV/Excel processing, and workbook export.
+- `plotly` — interactive HTML dashboard generation.
+- `requests` — direct HTTP downloads from FRED, Shiller, and CompaniesMarketCap pages.
+- `yfinance` — Yahoo Finance historical market data downloads.
+- `openpyxl` — writing the generated `.xlsx` workbook.
+- `xlrd` — reading older `.xls` workbooks, including Shiller's workbook format.
+
+### Optional: create an isolated virtual environment
+
+Recommended for repeatable runs:
+
+```bash
+python -m venv .venv
+
+# macOS / Linux
+source .venv/bin/activate
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+pip install numpy pandas plotly requests yfinance openpyxl xlrd
+```
+
+### Optional: save dependencies to `requirements.txt`
+
+You can create a `requirements.txt` file with:
+
+```text
+numpy
+pandas
+plotly
+requests
+yfinance
+openpyxl
+xlrd
+```
+
+Then install everything with:
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Quick start
 
@@ -323,6 +416,28 @@ python buffett_dashboard.py \
   --user-agent "Your Name your.email@example.com"
 ```
 
+### Conflicting visibility flags
+
+Avoid passing both the positive and negative form of the same visibility flag in one command.
+
+For example, avoid:
+
+```bash
+python buffett_dashboard.py --cape-std-lines --no-cape-std-lines
+```
+
+`argparse` accepts both, but the **last flag wins**. In the example above, CAPE standard-deviation lines will be hidden initially because `--no-cape-std-lines` appears last.
+
+Use only one form:
+
+```bash
+# Show CAPE standard-deviation lines initially
+python buffett_dashboard.py --cape-std-lines
+
+# Hide CAPE standard-deviation lines initially
+python buffett_dashboard.py --no-cape-std-lines
+```
+
 ## Data methodology
 
 ### Buffett Indicator
@@ -358,6 +473,24 @@ python buffett_dashboard.py
 The script also checks `SEC_USER_AGENT` as a fallback.
 
 ## Troubleshooting
+
+### `ModuleNotFoundError: No module named ...`
+
+This means a required third-party library is missing from your Python environment.
+
+Install all required packages:
+
+```bash
+python -m pip install numpy pandas plotly requests yfinance openpyxl xlrd
+```
+
+Then rerun:
+
+```bash
+python buffett_dashboard.py --user-agent "Your Name your.email@example.com"
+```
+
+If you use a virtual environment, make sure it is activated before installing and running the script.
 
 ### Downloads fail or return empty data
 
@@ -402,6 +535,7 @@ CompaniesMarketCap pages are parsed from public webpage content. If the website 
 .
 ├── buffett_dashboard.py
 ├── README.md
+├── requirements.txt
 └── output/
     ├── buffett_dashboard.html
     └── buffett_dashboard.xlsx
