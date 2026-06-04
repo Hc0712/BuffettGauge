@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Buffett Indicator + Shiller CAPE + Berkshire cash dashboard (v5)
+Buffett Indicator + Shiller CAPE + Berkshire cash dashboard 
 ==========================================================
 
 What the script does
@@ -32,10 +32,10 @@ Notes
 - The Buffett trend and +/- standard deviation bands are computed on a log scale
   so the reference lines remain proportional over long horizons, similar to the
   reference screenshots.
-- Berkshire cash/assets are sourced only from CompaniesMarketCap in v5 because
+- Berkshire cash/assets are sourced only from CompaniesMarketCap because
   the narrower SEC cash taxonomy used in prior versions could materially
   understate Berkshire's broader liquidity.
-- v5 removes all Berkshire SEC download code so the script no longer mixes two
+- Removes all Berkshire SEC download code so the script no longer mixes two
   incompatible Berkshire liquidity definitions in the same chart/workbook.
 - Progress messages remain visible during execution so long-running downloads are
   easier to understand.
@@ -50,7 +50,7 @@ import math
 import os
 import re
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -73,6 +73,9 @@ SHILLER_URLS = [
     "http://www.econ.yale.edu/~shiller/data/ie_data.xls",
 ]
 SHILLER_DISCOVERY_PAGE = "https://shillerdata.com/"
+# Treat the legacy Yale workbook as a fallback only. When this source is used,
+# the downloaded CAPE history may lag the current date by many months.
+SHILLER_FRESHNESS_WARNING_DAYS = 120
 CMC_BERKSHIRE_TOTAL_ASSETS_URL = "https://companiesmarketcap.com/berkshire-hathaway/total-assets/"
 CMC_BERKSHIRE_CASH_ON_HAND_URL = "https://companiesmarketcap.com/berkshire-hathaway/cash-on-hand/"
 DEFAULT_START = "1989-01-01"
@@ -452,35 +455,92 @@ def fetch_yahoo_history(ticker: str, start: str, interval: str = "1mo") -> pd.Da
     return result
 
 
+def _is_yale_shiller_url(url: str) -> bool:
+    """Return True when a candidate workbook URL points at the legacy Yale host.
+
+    Why this helper exists:
+    - The original script treated the Yale workbook as the primary source.
+    - Multiple public projects now document that the Yale workbook can lag the
+      current month, while shillerdata.com often exposes a newer mirrored file.
+    - The dashboard still keeps Yale as a safety fallback so users get *some*
+      CAPE history even when discovery fails, but that fallback should be labeled
+      clearly because the newest observations may be missing.
+    """
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return 'econ.yale.edu' in host
+
+
+def _shiller_data_lag_days(last_date: pd.Timestamp, as_of: Optional[pd.Timestamp] = None) -> int | None:
+    """Return how many days the parsed Shiller workbook trails the latest month-end.
+
+    Parameters
+    ----------
+    last_date:
+        Latest month-end found in the parsed workbook.
+    as_of:
+        Optional override mostly useful for tests. When omitted, the function
+        compares against the most recent completed month-end according to the
+        local runtime clock.
+
+    Returns
+    -------
+    int | None
+        Number of trailing days if both dates are valid, otherwise ``None``.
+
+    Why this helper matters:
+    - URL download success alone does not guarantee fresh CAPE data.
+    - The stale-data bug happened because an older Yale workbook parsed fine, so
+      the code stopped before checking whether a newer source was available.
+    - Measuring the gap lets the downloader prefer fresher sources and emit a
+      clear warning whenever it must settle for an old fallback file.
+    """
+    if pd.isna(last_date):
+        return None
+    reference_month_end = latest_complete_month_end(as_of)
+    return int((reference_month_end - pd.Timestamp(last_date)).days)
+
+
 def _discover_shiller_urls(session: requests.Session) -> list[str]:
     """Discover candidate Shiller workbook URLs.
 
-    Why this helper exists:
-    - Robert Shiller's historical workbook has moved over time.
-    - Public Shiller wrappers explicitly scrape shillerdata.com to discover the
-      current workbook URL, which is often hosted behind a changing wsimg URL.
-    - The function returns a de-duplicated list with the original Yale URLs
-      first, then any discovered shillerdata.com download URLs.
+    Important behavior change:
+    - Discovered shillerdata.com workbook links are now tried *before* the hard-
+      coded Yale URLs. This directly fixes the stale-data bug where a readable—
+      but outdated—Yale workbook caused an early return before the newer source
+      could even be attempted.
+    - The legacy Yale URLs remain in the list as a resilience fallback only.
+
+    Returns
+    -------
+    list[str]
+        Deduplicated candidate URLs ordered from most preferred to least
+        preferred. Discovery failures are tolerated so the dashboard can still
+        operate in degraded mode.
     """
-    candidates: list[str] = list(SHILLER_URLS)
+    discovered: list[str] = []
     try:
         response = session.get(SHILLER_DISCOVERY_PAGE, timeout=30)
         response.raise_for_status()
         html = response.text
-        discovered: list[str] = []
         href_pattern = r'(?:href|src)=["\']([^"\']*ie_data[^"\']*\.xls[^"\']*)["\']'
         direct_pattern = r'https?://[^"\'\s>]+ie_data[^"\'\s>]*\.xls(?:\?[^"\'\s>]*)?'
         for match in re.findall(href_pattern, html, flags=re.IGNORECASE):
             discovered.append(urljoin(SHILLER_DISCOVERY_PAGE, match))
         for match in re.findall(direct_pattern, html, flags=re.IGNORECASE):
             discovered.append(match)
-        for url in discovered:
-            if url not in candidates:
-                candidates.append(url)
     except Exception:
-        # Discovery failure should not break the dashboard; the static Yale URLs
-        # are still attempted first.
+        # Discovery failure should not break the dashboard. The code will fall
+        # back to the older Yale URLs, but a later warning makes that downgrade
+        # visible to the user if a Yale workbook is ultimately selected.
         pass
+
+    candidates: list[str] = []
+    for url in [*discovered, *SHILLER_URLS]:
+        if url not in candidates:
+            candidates.append(url)
     return candidates
 
 
@@ -532,19 +592,19 @@ def _standardize_shiller_frame(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_shiller_workbook(session: requests.Session) -> pd.DataFrame:
     """Download and parse Robert Shiller's latest workbook into monthly S&P/CAPE data.
 
-    Why the original implementation failed:
-    - The workbook structure varies by source and over time.
-    - On some runs, sheet 0 or the default header strategy yields an empty frame,
-      causing an out-of-bounds error when the code later assumes row 7 exists.
+    Key robustness upgrades:
+    1. Tries discovered shillerdata.com workbook links before the stale Yale URLs.
+    2. Measures data freshness after parsing instead of assuming every successful
+       download is current.
+    3. Prints an explicit warning whenever the old Yale URL is used as fallback,
+       because that path may omit the newest CAPE observations.
 
-    This version is more robust because it:
-    1. Tries multiple candidate URLs, including a scraped shillerdata.com link.
-    2. Tries multiple sheet/header layouts that are known to exist in public
-       Shiller data mirrors.
-    3. Validates row counts before touching header_row.
-    4. Falls back with a detailed error if all strategies fail.
+    The function still returns the best available workbook it can parse, even if
+    every source is stale, but it makes any such degradation obvious in the log.
     """
     errors: list[str] = []
+    stale_candidates: list[tuple[pd.Timestamp, bool, int | None, str, pd.DataFrame]] = []
+
     for url in _discover_shiller_urls(session):
         try:
             response = session.get(url, timeout=90)
@@ -554,44 +614,107 @@ def fetch_shiller_workbook(session: requests.Session) -> pd.DataFrame:
             errors.append(f'{url} -> download failed: {exc}')
             continue
 
+        parsed_frame: pd.DataFrame | None = None
+        parse_errors: list[str] = []
+
         for strategy in [
             {'sheet_name': 'Data', 'header': 7},
             {'sheet_name': 0, 'header': 7},
         ]:
             try:
                 parsed = pd.read_excel(io.BytesIO(content), engine='xlrd', **strategy)
-                return _standardize_shiller_frame(parsed)
+                parsed_frame = _standardize_shiller_frame(parsed)
+                break
             except Exception as exc:
-                errors.append(f'{url} -> strategy {strategy} failed: {exc}')
+                parse_errors.append(f'{url} -> strategy {strategy} failed: {exc}')
 
-        try:
-            raw = pd.read_excel(io.BytesIO(content), sheet_name=0, header=None, engine='xlrd')
-            if raw is None or raw.empty:
-                raise ValueError('raw workbook is empty')
+        if parsed_frame is None:
+            try:
+                raw = pd.read_excel(io.BytesIO(content), sheet_name=0, header=None, engine='xlrd')
+                if raw is None or raw.empty:
+                    raise ValueError('raw workbook is empty')
 
-            header_row = None
-            for idx in range(min(30, len(raw))):
-                row_text = [str(x).strip().lower() for x in raw.iloc[idx].tolist()]
-                has_date = any(cell == 'date' for cell in row_text)
-                has_cape = any('cape' in cell or 'pe10' in cell for cell in row_text)
-                if has_date and has_cape:
-                    header_row = idx
-                    break
+                header_row = None
+                for idx in range(min(30, len(raw))):
+                    row_text = [str(x).strip().lower() for x in raw.iloc[idx].tolist()]
+                    has_date = any(cell == 'date' for cell in row_text)
+                    has_cape = any('cape' in cell or 'pe10' in cell for cell in row_text)
+                    if has_date and has_cape:
+                        header_row = idx
+                        break
 
-            if header_row is None:
-                raise ValueError('no header row with date + CAPE markers was found in first 30 rows')
-            if header_row >= len(raw):
-                raise ValueError(f'discovered header row {header_row} is outside the workbook bounds ({len(raw)} rows)')
+                if header_row is None:
+                    raise ValueError('no header row with date + CAPE markers was found in first 30 rows')
+                if header_row >= len(raw):
+                    raise ValueError(f'discovered header row {header_row} is outside the workbook bounds ({len(raw)} rows)')
 
-            header_values = [str(x).strip() for x in raw.iloc[header_row].tolist()]
-            body = raw.iloc[header_row + 1 :].copy()
-            body.columns = header_values
-            return _standardize_shiller_frame(body)
-        except Exception as exc:
-            errors.append(f'{url} -> raw-sheet strategy failed: {exc}')
+                header_values = [str(x).strip() for x in raw.iloc[header_row].tolist()]
+                body = raw.iloc[header_row + 1 :].copy()
+                body.columns = header_values
+                parsed_frame = _standardize_shiller_frame(body)
+            except Exception as exc:
+                parse_errors.append(f'{url} -> raw-sheet strategy failed: {exc}')
+
+        if parsed_frame is None:
+            errors.extend(parse_errors)
+            continue
+
+        last_date = pd.Timestamp(parsed_frame['date'].max())
+        lag_days = _shiller_data_lag_days(last_date)
+        is_yale = _is_yale_shiller_url(url)
+
+        # A discovered mirror is accepted immediately when it appears current.
+        if (not is_yale) and (lag_days is None or lag_days <= SHILLER_FRESHNESS_WARNING_DAYS):
+            log_progress(
+                f"Using Shiller workbook source: {url} | latest CAPE row {last_date.date()}"
+            )
+            return parsed_frame
+
+        # Otherwise keep the parsed frame as a fallback candidate but continue
+        # searching for something fresher. The sort order later prefers the most
+        # recent date and, on ties, prefers non-Yale sources over Yale.
+        stale_candidates.append((last_date, not is_yale, lag_days, url, parsed_frame))
+        if is_yale:
+            if lag_days is None:
+                log_progress(
+                    f"WARNING: Parsed Shiller fallback from legacy Yale URL: {url}. "
+                    "This fallback may miss the newest CAPE data."
+                )
+            else:
+                log_progress(
+                    f"WARNING: Parsed Shiller fallback from legacy Yale URL: {url} | "
+                    f"latest CAPE row {last_date.date()} trails the latest completed month-end by {lag_days} days. "
+                    "The newest CAPE data may be missing from this fallback source."
+                )
+
+    if stale_candidates:
+        stale_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        last_date, prefers_non_yale, lag_days, url, frame = stale_candidates[0]
+        if _is_yale_shiller_url(url):
+            if lag_days is None:
+                log_progress(
+                    f"WARNING: Falling back to the old Yale Shiller workbook: {url}. "
+                    "Latest CAPE data may be lost when this fallback is used."
+                )
+            else:
+                log_progress(
+                    f"WARNING: Falling back to the old Yale Shiller workbook: {url} | "
+                    f"latest CAPE row {last_date.date()} trails the latest completed month-end by {lag_days} days. "
+                    "Latest CAPE data may be lost when this fallback is used."
+                )
+        else:
+            if lag_days is None:
+                log_progress(
+                    f"WARNING: Returning best available Shiller workbook from {url}, but freshness could not be assessed."
+                )
+            else:
+                log_progress(
+                    f"WARNING: Returning best available Shiller workbook from {url} | "
+                    f"latest CAPE row {last_date.date()} trails the latest completed month-end by {lag_days} days."
+                )
+        return frame
 
     raise RuntimeError('Unable to download and parse Shiller workbook. Detailed attempts: ' + ' | '.join(errors))
-
 
 
 def fetch_berkshire_history(session: requests.Session, ticker: str = "BRK-B") -> BerkshireHistoryBundle:
