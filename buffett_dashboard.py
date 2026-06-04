@@ -78,6 +78,7 @@ CMC_BERKSHIRE_CASH_ON_HAND_URL = "https://companiesmarketcap.com/berkshire-hatha
 DEFAULT_START = "1950-01-01"
 DEFAULT_OUTPUT_HTML = "buffett_dashboard.html"
 DEFAULT_OUTPUT_XLSX = "buffett_dashboard.xlsx"
+STDDEV_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,77 @@ def ensure_output_dir(path: Path) -> Path:
 def clean_numeric_series(series: pd.Series) -> pd.Series:
     """Convert strings to numeric while safely coercing non-numeric values."""
     return pd.to_numeric(series, errors="coerce")
+
+
+def _format_stddev_suffix(multiplier: float) -> str:
+    """Return a stable column-name suffix for a standard-deviation multiplier.
+
+    Examples
+    --------
+    0.5 -> ``0_5``
+    1.0 -> ``1``
+    1.5 -> ``1_5``
+
+    Using underscores instead of decimal points keeps the exported Excel column
+    names easy to reference from formulas and downstream automation.
+    """
+    if float(multiplier).is_integer():
+        return str(int(multiplier))
+    return str(multiplier).replace(".", "_")
+
+
+def add_stddev_level_columns(
+    df: pd.DataFrame,
+    source_col: str,
+    prefix: str,
+    *,
+    include_mean: bool = True,
+    floor_at_zero: bool = False,
+) -> pd.DataFrame:
+    """Append mean and +/- standard-deviation level columns for one series.
+
+    The user requested these extra Excel columns for the raw exported sheets.
+    This helper computes a single historical mean/std pair from ``source_col``
+    and writes constant reference-level columns for +/-0.5, +/-1.0, +/-1.5, and
+    +/-2.0 standard deviations.
+
+    Parameters
+    ----------
+    df:
+        Source dataframe to augment.
+    source_col:
+        Name of the numeric column whose historical distribution is used.
+    prefix:
+        Prefix used for the generated output column names.
+    include_mean:
+        When True, also writes ``{prefix}_mean``.
+    floor_at_zero:
+        When True, negative lower-band values are clipped to zero which is useful
+        for non-negative series such as CAPE, index levels, and market-cap/GDP %.
+    """
+    out = df.copy()
+    series = clean_numeric_series(out[source_col]).dropna()
+
+    if series.empty:
+        mean_value = np.nan
+        std_value = np.nan
+    else:
+        mean_value = float(series.mean())
+        std_value = float(series.std(ddof=1)) if len(series) > 1 else 0.0
+
+    if include_mean:
+        out[f"{prefix}_mean"] = mean_value
+
+    for multiplier in STDDEV_MULTIPLIERS:
+        suffix = _format_stddev_suffix(multiplier)
+        plus_value = mean_value + (multiplier * std_value)
+        minus_value = mean_value - (multiplier * std_value)
+        if floor_at_zero and pd.notna(minus_value):
+            minus_value = max(0.0, minus_value)
+        out[f"{prefix}_plus_{suffix}sd"] = plus_value
+        out[f"{prefix}_minus_{suffix}sd"] = minus_value
+
+    return out
 
 
 def normalize_ticker(text: str) -> str:
@@ -671,21 +743,35 @@ def build_buffett_series(session: requests.Session, start: str) -> pd.DataFrame:
     work["buffett_trend_plus_2sd"] = trend * np.exp(2.0 * sigma_log)
     work["buffett_trend_minus_1sd"] = trend * np.exp(-1.0 * sigma_log)
     work["buffett_trend_minus_2sd"] = trend * np.exp(-2.0 * sigma_log)
+
+    # Add fixed historical mean +/- standard-deviation reference levels to the
+    # Excel export without disturbing the existing dynamic trend-band columns
+    # used by the dashboard chart.
+    work = add_stddev_level_columns(
+        work,
+        source_col="buffett_index_pct",
+        prefix="buffett_index",
+        include_mean=True,
+        floor_at_zero=True,
+    )
     return work.reset_index(drop=True)
 
 
 def build_shiller_series(session: requests.Session, start: str) -> pd.DataFrame:
-    """Build the Shiller CAPE / S&P history plus mean and +/-1 sigma bands."""
+    """Build the Shiller CAPE / S&P history plus expanded standard-deviation levels."""
     shiller = fetch_shiller_workbook(session)
     shiller = shiller[shiller["date"] >= pd.Timestamp(start)].copy()
     shiller = shiller.rename(columns={"sp500_shiller": "sp500_index", "cape": "shiller_cape"})
 
-    cape = shiller["shiller_cape"].dropna()
-    cape_mean = float(cape.mean())
-    cape_std = float(cape.std(ddof=1))
-    shiller["cape_mean"] = cape_mean
-    shiller["cape_plus_1sd"] = cape_mean + cape_std
-    shiller["cape_minus_1sd"] = max(0.0, cape_mean - cape_std)
+    # Preserve the existing CAPE mean/+/-1sd columns for backward compatibility
+    # while also adding the newly requested +/-0.5, +/-1.5, and +/-2.0 levels.
+    shiller = add_stddev_level_columns(
+        shiller,
+        source_col="shiller_cape",
+        prefix="cape",
+        include_mean=True,
+        floor_at_zero=True,
+    )
     return shiller.reset_index(drop=True)
 
 
@@ -706,11 +792,40 @@ def build_combined_monthly_sheet(
 
     merged = spine.merge(buffett, on="date", how="left")
     merged = merged.merge(
-        shiller[["date", "sp500_index", "shiller_cape", "cape_mean", "cape_plus_1sd", "cape_minus_1sd"]],
+        shiller[[
+            "date",
+            "sp500_index",
+            "shiller_cape",
+            "cape_mean",
+            "cape_plus_0_5sd",
+            "cape_minus_0_5sd",
+            "cape_plus_1sd",
+            "cape_minus_1sd",
+            "cape_plus_1_5sd",
+            "cape_minus_1_5sd",
+            "cape_plus_2sd",
+            "cape_minus_2sd",
+        ]],
         on="date",
         how="left",
     )
-    merged = merged.merge(sp500_yahoo[["date", "sp500_yahoo"]], on="date", how="left")
+    merged = merged.merge(
+        sp500_yahoo[[
+            "date",
+            "sp500_yahoo",
+            "sp500_yahoo_mean",
+            "sp500_yahoo_plus_0_5sd",
+            "sp500_yahoo_minus_0_5sd",
+            "sp500_yahoo_plus_1sd",
+            "sp500_yahoo_minus_1sd",
+            "sp500_yahoo_plus_1_5sd",
+            "sp500_yahoo_minus_1_5sd",
+            "sp500_yahoo_plus_2sd",
+            "sp500_yahoo_minus_2sd",
+        ]],
+        on="date",
+        how="left",
+    )
     merged = merged.merge(
         brk[["date", "brk_cash_usd", "brk_total_assets_usd", "brk_cash_to_assets_pct", "brk_cash_source", "brk_total_assets_source", "brk_data_status"]],
         on="date",
@@ -970,6 +1085,16 @@ def main() -> None:
     except Exception as exc:
         log_progress(f"Yahoo S&P download failed ({exc}); falling back to Shiller S&P column", started_at)
         sp500_yahoo = shiller[["date", "sp500_index"]].rename(columns={"sp500_index": "sp500_yahoo"}).copy()
+
+    # Add the requested historical mean +/- standard-deviation levels directly
+    # in the dedicated S&P worksheet before the workbook is written.
+    sp500_yahoo = add_stddev_level_columns(
+        sp500_yahoo,
+        source_col="sp500_yahoo",
+        prefix="sp500_yahoo",
+        include_mean=True,
+        floor_at_zero=True,
+    )
 
     log_progress("Downloading Berkshire history from CompaniesMarketCap only", started_at)
     brk_bundle = fetch_berkshire_history(session, ticker="BRK-B")

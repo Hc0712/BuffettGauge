@@ -202,6 +202,7 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+.vs/
 
 # Ruff stuff:
 .ruff_cache/
@@ -216,3 +217,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Output by this script
+.html
+.xlsx
