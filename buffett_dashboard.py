@@ -299,6 +299,73 @@ def stddev_initial_visibility(show_std_lines: bool, mode: str, selected_mode: st
     return bool(show_std_lines and mode == selected_mode and abs(float(multiplier)) in selected_stddev_multipliers(stddev_line_count))
 
 
+def _matching_numeric_columns(df: pd.DataFrame, *, exact_names: Iterable[str] = (), prefixes: Iterable[str] = ()) -> list[str]:
+    """Return existing numeric-like columns that match the provided names/prefixes.
+
+    The dashboard overlays many optional standard-deviation guide lines. Plotly
+    autoranges an axis from *visible* traces, so hiding/showing guide lines can
+    change the main chart scale. This helper lets the figure builder collect the
+    full family of columns that belong to one axis so a stable, explicit axis
+    range can be calculated once during figure creation.
+    """
+    exact = {str(name) for name in exact_names}
+    prefix_values = tuple(str(prefix) for prefix in prefixes)
+    matches: list[str] = []
+    for column in df.columns:
+        if column in exact or any(column.startswith(prefix) for prefix in prefix_values):
+            matches.append(column)
+    return matches
+
+
+
+def _stable_axis_range(
+    df: pd.DataFrame,
+    *,
+    exact_names: Iterable[str] = (),
+    prefixes: Iterable[str] = (),
+    floor_at_zero: bool = False,
+    pad_ratio: float = 0.06,
+    fallback: tuple[float, float] = (0.0, 1.0),
+) -> list[float]:
+    """Build a fixed axis range that covers the main series and all guide lines.
+
+    Why this exists:
+    - the Std On/Off buttons should only show or hide the related guide lines;
+    - with Plotly autorange, making those traces visible can change the y-axis;
+    - using one precomputed range keeps Graph 1/2/3 visually stable.
+
+    The function inspects every matched column, ignores missing/non-numeric
+    values, adds a small padding margin, and optionally clamps the lower bound
+    to zero for naturally non-negative finance metrics.
+    """
+    columns = _matching_numeric_columns(df, exact_names=exact_names, prefixes=prefixes)
+    if not columns:
+        return [float(fallback[0]), float(fallback[1])]
+
+    numeric_series = [pd.to_numeric(df[column], errors="coerce") for column in columns]
+    merged = pd.concat(numeric_series, axis=0, ignore_index=True).dropna()
+    if merged.empty:
+        return [float(fallback[0]), float(fallback[1])]
+
+    min_value = float(merged.min())
+    max_value = float(merged.max())
+    if floor_at_zero:
+        min_value = 0.0 if min_value >= 0 else min_value
+
+    span = max_value - min_value
+    if not np.isfinite(span) or span <= 0:
+        span = max(abs(max_value), 1.0) * 0.10
+    pad = span * float(pad_ratio)
+
+    lower = min_value - pad
+    upper = max_value + pad
+    if floor_at_zero:
+        lower = max(0.0, lower)
+    if upper <= lower:
+        upper = lower + max(abs(lower), 1.0) * 0.10
+    return [float(lower), float(upper)]
+
+
 def normalize_ticker(text: str) -> str:
     """Normalize tickers so BRK.B, BRK-B, and BRKB can be compared easily."""
     return re.sub(r"[^A-Z0-9]", "", text.upper())
@@ -1005,6 +1072,76 @@ def build_shiller_series(session: requests.Session, start: str) -> pd.DataFrame:
 
 
 
+def prepare_sp500_yahoo_frame_for_dashboard(sp500_yahoo: pd.DataFrame) -> pd.DataFrame:
+    """Return a dashboard-ready S&P 500 Yahoo frame with stable export columns.
+
+    Why this helper exists:
+    - ``fetch_yahoo_history()`` returns a generic two-column frame named
+      ``date`` + ``value`` rather than the dashboard-specific ``sp500_yahoo``
+      column expected by later merge/plot functions.
+    - ``build_combined_monthly_sheet()`` also expects the raw mean and standard-
+      deviation export columns to exist, but those columns are only guaranteed in
+      the plotting path unless we normalize the Yahoo frame explicitly.
+
+    What this helper does:
+    1) renames the Yahoo price column to ``sp500_yahoo`` when needed;
+    2) coerces the date/value columns into the expected types and order; and
+    3) adds the raw standard-deviation export columns when they are missing.
+
+    Keeping this logic in one reusable helper prevents future regressions where
+    one call path prepares the S&P frame but another call path forgets to do so.
+    """
+    frame = sp500_yahoo.copy()
+    if frame.empty:
+        return frame
+
+    # ``fetch_yahoo_history()`` returns ``value`` for all tickers.  The dashboard
+    # code, workbook export, and Panel 2/3 plotting logic all expect the more
+    # explicit ``sp500_yahoo`` column name, so normalize it here.
+    if "sp500_yahoo" not in frame.columns:
+        if "value" in frame.columns:
+            frame = frame.rename(columns={"value": "sp500_yahoo"})
+        elif "close" in frame.columns:
+            frame = frame.rename(columns={"close": "sp500_yahoo"})
+        elif "Close" in frame.columns:
+            frame = frame.rename(columns={"Close": "sp500_yahoo"})
+        else:
+            raise KeyError(
+                "S&P 500 Yahoo frame is missing the expected price column. "
+                f"Available columns: {list(frame.columns)}"
+            )
+
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["sp500_yahoo"] = pd.to_numeric(frame["sp500_yahoo"], errors="coerce")
+    frame = frame.dropna(subset=["date", "sp500_yahoo"]).sort_values("date").copy()
+
+    # Rebuild the raw mean +/- std-dev export columns every time this helper runs.
+    # This keeps the workbook/chart export consistent even when callers first
+    # download the raw Yahoo frame, then later filter it down to the latest fully
+    # completed month before exporting or plotting.
+    raw_std_columns = [
+        "sp500_yahoo_mean",
+        "sp500_yahoo_plus_0_5sd",
+        "sp500_yahoo_minus_0_5sd",
+        "sp500_yahoo_plus_1sd",
+        "sp500_yahoo_minus_1sd",
+        "sp500_yahoo_plus_1_5sd",
+        "sp500_yahoo_minus_1_5sd",
+        "sp500_yahoo_plus_2sd",
+        "sp500_yahoo_minus_2sd",
+    ]
+    frame = frame.drop(columns=[col for col in raw_std_columns if col in frame.columns])
+    frame = add_stddev_level_columns(
+        frame,
+        source_col="sp500_yahoo",
+        prefix="sp500_yahoo",
+        include_mean=True,
+        floor_at_zero=True,
+    )
+
+    return frame.reset_index(drop=True)
+
+
 def build_combined_monthly_sheet(
     buffett: pd.DataFrame,
     shiller: pd.DataFrame,
@@ -1016,6 +1153,10 @@ def build_combined_monthly_sheet(
     v5 keeps the dedicated Yahoo S&P export in the combined sheet and also
     preserves Berkshire source columns so users can audit the final CompaniesMarketCap-only history.
     """
+    # Normalize the Yahoo S&P frame here so workbook export remains robust even
+    # if future callers pass the raw ``fetch_yahoo_history()`` output directly.
+    sp500_yahoo = prepare_sp500_yahoo_frame_for_dashboard(sp500_yahoo)
+
     start_date = min(buffett["date"].min(), shiller["date"].min(), brk["date"].min(), sp500_yahoo["date"].min())
     end_date = max(buffett["date"].max(), shiller["date"].max(), brk["date"].max(), sp500_yahoo["date"].max())
     spine = pd.DataFrame({"date": pd.date_range(start_date, end_date, freq="ME")})
@@ -1119,18 +1260,14 @@ def build_dashboard_figure(
     brk: pd.DataFrame,
     sp500_yahoo: Optional[pd.DataFrame] = None,
     *,
-    cape_stddev_mode: str = "raw",
-    buffett_stddev_mode: str = "log",
-    sp500_stddev_mode: str = "raw",
-    stddev_line_count: int = 4,
-    show_cape_std_lines: bool = True,
-    show_buffett_std_lines: bool = True,
-    show_sp500_std_lines: bool = False,
+    stddev_modes: dict[str, str],
+    show_std_lines: dict[str, bool],
+    stddev_line_counts: dict[str, int],
 ) -> go.Figure:
-    """Create the three-panel Plotly dashboard with the requested graph fixes.
+    """Create the four-panel Plotly dashboard with the requested graph fixes.
 
     Fixes included:
-    - larger vertical spacing between the three panels;
+    - larger vertical spacing between the four panels;
     - custom bold black ``Year`` labels placed next to the latest year tick;
     - extra right-side plotting room so standard-deviation labels and right y-axes do not collide;
     - the middle-panel S&P 500 line uses the dedicated Yahoo series so it
@@ -1166,30 +1303,54 @@ def build_dashboard_figure(
         )
 
     fig = make_subplots(
-        rows=3,
+        rows=4,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.10,
-        row_heights=[0.38, 0.32, 0.30],
-        specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{}]],
+        vertical_spacing=0.08,
+        row_heights=[0.30, 0.24, 0.24, 0.22],
+        specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{"secondary_y": True}], [{}]],
         subplot_titles=(
             "Buffett Indicator and Shiller CAPE ratio",
             "S&P 500 index and Buffett Indicator",
+            "S&P 500 index and Shiller CAPE ratio",
             "Berkshire Hathaway cash on hand and total assets (CompaniesMarketCap source)",
         ),
     )
 
-    cape_stddev_mode = cape_stddev_mode.lower()
-    buffett_stddev_mode = buffett_stddev_mode.lower()
-    sp500_stddev_mode = sp500_stddev_mode.lower()
-    if cape_stddev_mode not in {"raw", "log"}:
-        raise ValueError("cape_stddev_mode must be 'raw' or 'log'")
-    if buffett_stddev_mode not in {"raw", "log"}:
-        raise ValueError("buffett_stddev_mode must be 'raw' or 'log'")
-    if sp500_stddev_mode not in {"raw", "log"}:
-        raise ValueError("sp500_stddev_mode must be 'raw' or 'log'")
-    if stddev_line_count not in {4, 8}:
-        raise ValueError("stddev_line_count must be 4 or 8")
+    stddev_mode_defaults = {
+        "cape_graph1": "raw",
+        "buffett_graph1": "log",
+        "sp500_graph2": "raw",
+        "buffett_graph2": "log",
+        "sp500_graph3": "raw",
+        "cape_graph3": "raw",
+    }
+    stddev_visible_defaults = {
+        "cape_graph1": True,
+        "buffett_graph1": True,
+        "sp500_graph2": False,
+        "buffett_graph2": True,
+        "sp500_graph3": False,
+        "cape_graph3": True,
+    }
+    stddev_modes = {
+        group: str(stddev_modes.get(group, default)).lower()
+        for group, default in stddev_mode_defaults.items()
+    }
+    show_std_lines = {
+        group: bool(show_std_lines.get(group, default))
+        for group, default in stddev_visible_defaults.items()
+    }
+    stddev_line_counts = {
+        group: int(stddev_line_counts.get(group, 4))
+        for group in stddev_mode_defaults
+    }
+    for group, mode in stddev_modes.items():
+        if mode not in {"raw", "log"}:
+            raise ValueError(f"stddev mode for {group} must be 'raw' or 'log'")
+    for group, line_count in stddev_line_counts.items():
+        if line_count not in {4, 8}:
+            raise ValueError(f"stddev line count for {group} must be 4 or 8")
 
     # Add all raw/log and 4/8-line candidates. Custom JavaScript controls decide
     # which mutually-exclusive mode/count is visible in the exported HTML.
@@ -1205,6 +1366,16 @@ def build_dashboard_figure(
         "raw": make_stddev_band_specs("sp500_yahoo", "raw", None),
         "log": make_stddev_band_specs("sp500_yahoo", "log", None),
     }
+    # Graph 3 reuses the same underlying S&P and CAPE calculations, but it gets
+    # its own Std-control groups so the top switchers affect only the matching graph.
+    sp500_graph3_band_specs_by_mode = {
+        "raw": make_stddev_band_specs("sp500_yahoo", "raw", None),
+        "log": make_stddev_band_specs("sp500_yahoo", "log", None),
+    }
+    cape_graph3_band_specs_by_mode = {
+        "raw": make_stddev_band_specs("cape", "raw", None),
+        "log": make_stddev_band_specs("cape", "log", None),
+    }
 
     # --- Panel 1: Buffett Indicator + CAPE (dual axis) ---
     add_grouped_trace(
@@ -1214,7 +1385,8 @@ def build_dashboard_figure(
             y=buffett["buffett_index_pct"],
             mode="lines",
             name="Buffett Indicator",
-            legendgroup="buffett",
+            legendgroup="graph_1",
+            legendgrouptitle_text="Graph 1 · Buffett Indicator + CAPE",
             line=dict(color="#d62728", width=3.2),
             hovertemplate="%{x|%Y-%m}<br>Buffett Indicator: %{y:.2f}%<extra></extra>",
         ),
@@ -1224,7 +1396,7 @@ def build_dashboard_figure(
     for mode, specs in buffett_band_specs_by_mode.items():
         for ycol, short_label, multiplier in specs:
             label = f"Buffett {short_label}"
-            visible = stddev_initial_visibility(show_buffett_std_lines, mode, buffett_stddev_mode, multiplier, stddev_line_count)
+            visible = stddev_initial_visibility(show_std_lines["buffett_graph1"], mode, stddev_modes["buffett_graph1"], multiplier, stddev_line_counts["buffett_graph1"])
             add_grouped_trace(
                 fig,
                 go.Scatter(
@@ -1235,7 +1407,7 @@ def build_dashboard_figure(
                     legendgroup="buffett_std",
                     showlegend=False,
                     visible=visible,
-                    meta=dict(stdControl=True, stdGroup="buffett", stdMode=mode, stdMultiplier=abs(float(multiplier))),
+                    meta=dict(stdControl=True, stdGroup="buffett_graph1", stdMode=mode, stdMultiplier=abs(float(multiplier))),
                     line=dict(color=stddev_band_color("214, 39, 40", multiplier), width=1.5, dash="dash"),
                     hovertemplate=f"%{{x|%Y-%m}}<br>{label}: %{{y:.2f}}%<extra></extra>",
                 ),
@@ -1250,7 +1422,7 @@ def build_dashboard_figure(
             y=shiller["shiller_cape"],
             mode="lines",
             name="Shiller CAPE Ratio",
-            legendgroup="cape",
+            legendgroup="graph_1",
             line=dict(color="#2ca02c", width=3.2),
             hovertemplate="%{x|%Y-%m}<br>Shiller CAPE Ratio: %{y:.2f}<extra></extra>",
         ),
@@ -1260,7 +1432,7 @@ def build_dashboard_figure(
     for mode, specs in cape_band_specs_by_mode.items():
         for ycol, short_label, multiplier in specs:
             label = f"CAPE {short_label}"
-            visible = stddev_initial_visibility(show_cape_std_lines, mode, cape_stddev_mode, multiplier, stddev_line_count)
+            visible = stddev_initial_visibility(show_std_lines["cape_graph1"], mode, stddev_modes["cape_graph1"], multiplier, stddev_line_counts["cape_graph1"])
             add_grouped_trace(
                 fig,
                 go.Scatter(
@@ -1271,7 +1443,7 @@ def build_dashboard_figure(
                     legendgroup="cape_std",
                     showlegend=False,
                     visible=visible,
-                    meta=dict(stdControl=True, stdGroup="cape", stdMode=mode, stdMultiplier=abs(float(multiplier))),
+                    meta=dict(stdControl=True, stdGroup="cape_graph1", stdMode=mode, stdMultiplier=abs(float(multiplier))),
                     line=dict(color=stddev_band_color("44, 160, 44", multiplier), width=1.5, dash="dash"),
                     hovertemplate=f"%{{x|%Y-%m}}<br>{label}: %{{y:.2f}}<extra></extra>",
                 ),
@@ -1287,7 +1459,8 @@ def build_dashboard_figure(
             y=sp500_plot["sp500_yahoo"],
             mode="lines",
             name="S&P 500 Index",
-            legendgroup="spx",
+            legendgroup="graph_2",
+            legendgrouptitle_text="Graph 2 · S&P 500 + Buffett Indicator",
             line=dict(color="#1f77b4", width=3.2),
             hovertemplate="%{x|%Y-%m}<br>S&P 500 Index: %{y:,.2f}<extra></extra>",
         ),
@@ -1297,7 +1470,7 @@ def build_dashboard_figure(
     for mode, specs in sp500_band_specs_by_mode.items():
         for ycol, short_label, multiplier in specs:
             label = f"S&P 500 {short_label}"
-            visible = stddev_initial_visibility(show_sp500_std_lines, mode, sp500_stddev_mode, multiplier, stddev_line_count)
+            visible = stddev_initial_visibility(show_std_lines["sp500_graph2"], mode, stddev_modes["sp500_graph2"], multiplier, stddev_line_counts["sp500_graph2"])
             add_grouped_trace(
                 fig,
                 go.Scatter(
@@ -1308,7 +1481,7 @@ def build_dashboard_figure(
                     legendgroup="sp500_std",
                     showlegend=False,
                     visible=visible,
-                    meta=dict(stdControl=True, stdGroup="sp500", stdMode=mode, stdMultiplier=abs(float(multiplier))),
+                    meta=dict(stdControl=True, stdGroup="sp500_graph2", stdMode=mode, stdMultiplier=abs(float(multiplier))),
                     line=dict(color=stddev_band_color("31, 119, 180", multiplier), width=1.5, dash="dash"),
                     hovertemplate=f"%{{x|%Y-%m}}<br>{label}: %{{y:,.2f}}<extra></extra>",
                 ),
@@ -1323,7 +1496,7 @@ def build_dashboard_figure(
             y=buffett["buffett_index_pct"],
             mode="lines",
             name="Buffett Indicator (Middle Panel)",
-            legendgroup="buffett_mid",
+            legendgroup="graph_2",
             line=dict(color="#d62728", width=3.2),
             hovertemplate="%{x|%Y-%m}<br>Buffett Indicator: %{y:.2f}%<extra></extra>",
         ),
@@ -1334,7 +1507,7 @@ def build_dashboard_figure(
         for ycol, short_label, multiplier in specs:
             label = f"Buffett {short_label} (Middle Panel)"
             clean_label = label.replace(" (Middle Panel)", "")
-            visible = stddev_initial_visibility(show_buffett_std_lines, mode, buffett_stddev_mode, multiplier, stddev_line_count)
+            visible = stddev_initial_visibility(show_std_lines["buffett_graph2"], mode, stddev_modes["buffett_graph2"], multiplier, stddev_line_counts["buffett_graph2"])
             add_grouped_trace(
                 fig,
                 go.Scatter(
@@ -1345,7 +1518,7 @@ def build_dashboard_figure(
                     legendgroup="buffett_std",
                     showlegend=False,
                     visible=visible,
-                    meta=dict(stdControl=True, stdGroup="buffett", stdMode=mode, stdMultiplier=abs(float(multiplier))),
+                    meta=dict(stdControl=True, stdGroup="buffett_graph2", stdMode=mode, stdMultiplier=abs(float(multiplier))),
                     line=dict(color=stddev_band_color("214, 39, 40", multiplier), width=1.5, dash="dash"),
                     hovertemplate=f"%{{x|%Y-%m}}<br>{clean_label}: %{{y:.2f}}%<extra></extra>",
                 ),
@@ -1353,7 +1526,89 @@ def build_dashboard_figure(
                 secondary_y=True,
             )
 
-    # --- Panel 3: Berkshire grouped bars ---
+    # --- Panel 3: S&P 500 + Shiller CAPE (dual axis) ---
+    add_grouped_trace(
+        fig,
+        go.Scatter(
+            x=sp500_plot["date"],
+            y=sp500_plot["sp500_yahoo"],
+            mode="lines",
+            name="S&P 500 Index",
+            legendgroup="graph_3",
+            legendgrouptitle_text="Graph 3 · S&P 500 + Shiller CAPE",
+            line=dict(color="#1f77b4", width=3.2),
+            hovertemplate="%{x|%Y-%m}<br>S&P 500 Index: %{y:,.2f}<extra></extra>",
+        ),
+        row=3,
+        secondary_y=False,
+    )
+    for mode, specs in sp500_graph3_band_specs_by_mode.items():
+        for ycol, short_label, multiplier in specs:
+            label = f"S&P 500 {short_label}"
+            clean_label = label
+            visible = stddev_initial_visibility(show_std_lines["sp500_graph3"], mode, stddev_modes["sp500_graph3"], multiplier, stddev_line_counts["sp500_graph3"])
+            add_grouped_trace(
+                fig,
+                go.Scatter(
+                    x=sp500_band_source["date"],
+                    y=sp500_band_source[ycol],
+                    mode="lines",
+                    name=label,
+                    legendgroup="sp500_graph3_std",
+                    showlegend=False,
+                    visible=visible,
+                    meta=dict(stdControl=True, stdGroup="sp500_graph3", stdMode=mode, stdMultiplier=abs(float(multiplier))),
+                    line=dict(color=stddev_band_color("31, 119, 180", multiplier), width=1.5, dash="dash"),
+                    hovertemplate=f"%{{x|%Y-%m}}<br>{clean_label}: %{{y:,.2f}}<extra></extra>",
+                ),
+                row=3,
+                secondary_y=False,
+            )
+
+    add_grouped_trace(
+        fig,
+        go.Scatter(
+            x=shiller["date"],
+            y=shiller["shiller_cape"],
+            mode="lines",
+            name="Shiller CAPE Ratio",
+            legendgroup="graph_3",
+            line=dict(color="#2ca02c", width=3.2),
+            hovertemplate="%{x|%Y-%m}<br>Shiller CAPE Ratio: %{y:.2f}<extra></extra>",
+        ),
+        row=3,
+        secondary_y=True,
+    )
+    for mode, specs in cape_graph3_band_specs_by_mode.items():
+        for ycol, short_label, multiplier in specs:
+            label = f"CAPE {short_label}"
+            clean_label = label
+            visible = stddev_initial_visibility(
+                show_std_lines["cape_graph3"],
+                mode,
+                stddev_modes["cape_graph3"],
+                multiplier,
+                stddev_line_counts["cape_graph3"],
+            )
+            add_grouped_trace(
+                fig,
+                go.Scatter(
+                    x=shiller["date"],
+                    y=shiller[ycol],
+                    mode="lines",
+                    name=label,
+                    legendgroup="cape_graph3_std",
+                    showlegend=False,
+                    visible=visible,
+                    meta=dict(stdControl=True, stdGroup="cape_graph3", stdMode=mode, stdMultiplier=abs(float(multiplier))),
+                    line=dict(color=stddev_band_color("44, 160, 44", multiplier), width=1.5, dash="dash"),
+                    hovertemplate=f"%{{x|%Y-%m}}<br>{clean_label}: %{{y:.2f}}<extra></extra>",
+                ),
+                row=3,
+                secondary_y=True,
+            )
+
+    # --- Panel 4: Berkshire grouped bars ---
     # A single invisible hover carrier prevents duplicated year rows in unified hover.
     # The visible bars keep the legend and visual encoding, but do not emit hover rows.
     # The unified hover title remains the single year; the body starts with Cash / Assets (%).
@@ -1381,7 +1636,7 @@ def build_dashboard_figure(
                 "<extra></extra>"
             ),
         ),
-        row=3,
+        row=4,
         secondary_y=False,
     )
 
@@ -1391,13 +1646,14 @@ def build_dashboard_figure(
             x=brk["date"],
             y=brk["brk_cash_usd"] / 1_000_000_000.0,
             name="BRK.B cash on hand",
-            legendgroup="brk_cash",
+            legendgroup="panel_4",
+            legendgrouptitle_text="Graph 4 · Berkshire cash + assets",
             marker_color="#10b981",
             opacity=0.82,
             hoverinfo="skip",
             hovertemplate=None,
         ),
-        row=3,
+        row=4,
         secondary_y=False,
     )
     add_grouped_trace(
@@ -1406,19 +1662,46 @@ def build_dashboard_figure(
             x=brk["date"],
             y=brk["brk_total_assets_usd"] / 1_000_000_000.0,
             name="BRK.B total assets",
-            legendgroup="brk_assets",
+            legendgroup="panel_4",
             marker_color="#f59e0b",
             opacity=0.70,
             hoverinfo="skip",
             hovertemplate=None,
         ),
-        row=3,
+        row=4,
         secondary_y=False,
     )
 
-    sp500_max = float(sp500_plot["sp500_yahoo"].max()) if not sp500_plot.empty else 10000.0
+    sp500_range_columns = _matching_numeric_columns(
+        sp500_band_source,
+        exact_names=("sp500_yahoo",),
+        prefixes=("sp500_yahoo_",),
+    )
+    sp500_max = 10000.0
+    if sp500_range_columns:
+        sp500_numeric = pd.concat(
+            [pd.to_numeric(sp500_band_source[column], errors="coerce") for column in sp500_range_columns],
+            axis=0,
+            ignore_index=True,
+        ).dropna()
+        if not sp500_numeric.empty:
+            sp500_max = float(sp500_numeric.max())
     sp500_axis_max = max(10000, int(math.ceil(sp500_max / 1000.0) * 1000.0))
     sp500_gridvals = list(range(1000, sp500_axis_max + 1, 1000))
+    buffett_axis_range = _stable_axis_range(
+        buffett,
+        exact_names=("buffett_index_pct",),
+        prefixes=("buffett_",),
+        floor_at_zero=True,
+        fallback=(0.0, 100.0),
+    )
+    cape_axis_range = _stable_axis_range(
+        shiller,
+        exact_names=("shiller_cape",),
+        prefixes=("cape_",),
+        floor_at_zero=True,
+        fallback=(0.0, 40.0),
+    )
 
     all_dates = pd.concat(
         [
@@ -1444,6 +1727,8 @@ def build_dashboard_figure(
         row=1,
         col=1,
         secondary_y=False,
+        range=buffett_axis_range,
+        autorange=False,
         title_font=dict(color="#d62728"),
         tickfont=dict(color="#d62728"),
         automargin=True,
@@ -1454,6 +1739,8 @@ def build_dashboard_figure(
         row=1,
         col=1,
         secondary_y=True,
+        range=cape_axis_range,
+        autorange=False,
         title_font=dict(color="#2ca02c"),
         tickfont=dict(color="#2ca02c"),
         automargin=True,
@@ -1468,6 +1755,7 @@ def build_dashboard_figure(
         tickvals=sp500_gridvals,
         ticktext=[f"{value:,}" for value in sp500_gridvals],
         range=[0, sp500_axis_max],
+        autorange=False,
         showgrid=True,
         gridcolor="rgba(128, 128, 128, 0.50)",
         griddash="solid",
@@ -1483,24 +1771,62 @@ def build_dashboard_figure(
         row=2,
         col=1,
         secondary_y=True,
+        range=buffett_axis_range,
+        autorange=False,
         title_font=dict(color="#d62728"),
         tickfont=dict(color="#d62728"),
         automargin=True,
         title_standoff=34,
     )
-    fig.update_yaxes(title_text="USD billions", row=3, col=1, automargin=True, title_standoff=34)
+    fig.update_yaxes(
+        title_text="S&P 500 Index",
+        row=3,
+        col=1,
+        secondary_y=False,
+        tickmode="array",
+        tickvals=sp500_gridvals,
+        ticktext=[f"{value:,}" for value in sp500_gridvals],
+        range=[0, sp500_axis_max],
+        autorange=False,
+        showgrid=True,
+        gridcolor="rgba(128, 128, 128, 0.50)",
+        griddash="solid",
+        gridwidth=1.0,
+        zeroline=False,
+        title_font=dict(color="#1f77b4"),
+        tickfont=dict(color="#1f77b4"),
+        automargin=True,
+        title_standoff=34,
+    )
+    fig.update_yaxes(
+        title_text="Shiller CAPE Ratio",
+        row=3,
+        col=1,
+        secondary_y=True,
+        range=cape_axis_range,
+        autorange=False,
+        title_font=dict(color="#2ca02c"),
+        tickfont=dict(color="#2ca02c"),
+        automargin=True,
+        title_standoff=34,
+    )
+    fig.update_yaxes(title_text="USD billions", row=4, col=1, automargin=True, title_standoff=34)
 
-    for row in (1, 2, 3):
+    for row in (1, 2, 3, 4):
         fig.update_xaxes(row=row, col=1, **year_axis_settings)
 
     fig.update_layout(
-        title="Buffett Indicator dashboard with combined Buffett/CAPE and S&P/Buffett panels",
+        title="Buffett Indicator dashboard with Buffett/CAPE, S&P/Buffett, S&P/CAPE, and Berkshire panels",
         template="plotly_white",
         hovermode="x unified",
         hoverlabel=dict(font=dict(color="black")),
         barmode="group",
-        height=1320,
-        legend=dict(title="Click legend items to switch each output on/off", groupclick="togglegroup"),
+        height=1640,
+        legend=dict(
+            title="Click legend items to switch each output on/off",
+            groupclick="toggleitem",
+            tracegroupgap=12,
+        ),
         margin=dict(l=70, r=340, t=90, b=70),
     )
 
@@ -1566,20 +1892,29 @@ def build_dashboard_figure(
 
     for mode, specs in buffett_band_specs_by_mode.items():
         for ycol, short_label, multiplier in specs:
-            visible = stddev_initial_visibility(show_buffett_std_lines, mode, buffett_stddev_mode, multiplier, stddev_line_count)
-            _add_std_label(buffett, ycol, short_label, stddev_band_color("214, 39, 40", multiplier), "y", "buffett", mode, multiplier, visible)
-            _add_std_label(buffett, ycol, short_label, stddev_band_color("214, 39, 40", multiplier), "y4", "buffett", mode, multiplier, visible)
+            buffett_graph1_visible = stddev_initial_visibility(show_std_lines["buffett_graph1"], mode, stddev_modes["buffett_graph1"], multiplier, stddev_line_counts["buffett_graph1"])
+            _add_std_label(buffett, ycol, short_label, stddev_band_color("214, 39, 40", multiplier), "y", "buffett_graph1", mode, multiplier, buffett_graph1_visible)
+            buffett_graph2_visible = stddev_initial_visibility(show_std_lines["buffett_graph2"], mode, stddev_modes["buffett_graph2"], multiplier, stddev_line_counts["buffett_graph2"])
+            _add_std_label(buffett, ycol, short_label, stddev_band_color("214, 39, 40", multiplier), "y4", "buffett_graph2", mode, multiplier, buffett_graph2_visible)
     for mode, specs in cape_band_specs_by_mode.items():
         for ycol, short_label, multiplier in specs:
-            visible = stddev_initial_visibility(show_cape_std_lines, mode, cape_stddev_mode, multiplier, stddev_line_count)
-            _add_std_label(shiller, ycol, short_label, stddev_band_color("44, 160, 44", multiplier), "y2", "cape", mode, multiplier, visible)
+            visible = stddev_initial_visibility(show_std_lines["cape_graph1"], mode, stddev_modes["cape_graph1"], multiplier, stddev_line_counts["cape_graph1"])
+            _add_std_label(shiller, ycol, short_label, stddev_band_color("44, 160, 44", multiplier), "y2", "cape_graph1", mode, multiplier, visible)
     for mode, specs in sp500_band_specs_by_mode.items():
         for ycol, short_label, multiplier in specs:
-            visible = stddev_initial_visibility(show_sp500_std_lines, mode, sp500_stddev_mode, multiplier, stddev_line_count)
-            _add_std_label(sp500_band_source, ycol, short_label, stddev_band_color("31, 119, 180", multiplier), "y3", "sp500", mode, multiplier, visible)
+            visible = stddev_initial_visibility(show_std_lines["sp500_graph2"], mode, stddev_modes["sp500_graph2"], multiplier, stddev_line_counts["sp500_graph2"])
+            _add_std_label(sp500_band_source, ycol, short_label, stddev_band_color("31, 119, 180", multiplier), "y3", "sp500_graph2", mode, multiplier, visible)
+    for mode, specs in sp500_graph3_band_specs_by_mode.items():
+        for ycol, short_label, multiplier in specs:
+            visible = stddev_initial_visibility(show_std_lines["sp500_graph3"], mode, stddev_modes["sp500_graph3"], multiplier, stddev_line_counts["sp500_graph3"])
+            _add_std_label(sp500_band_source, ycol, short_label, stddev_band_color("31, 119, 180", multiplier), "y5", "sp500_graph3", mode, multiplier, visible)
+    for mode, specs in cape_graph3_band_specs_by_mode.items():
+        for ycol, short_label, multiplier in specs:
+            visible = stddev_initial_visibility(show_std_lines["cape_graph3"], mode, stddev_modes["cape_graph3"], multiplier, stddev_line_counts["cape_graph3"])
+            _add_std_label(shiller, ycol, short_label, stddev_band_color("44, 160, 44", multiplier), "y6", "cape_graph3", mode, multiplier, visible)
 
     # Custom x-axis titles, one per panel, positioned just to the right of the latest visible year.
-    for axis_name in ("yaxis", "yaxis3", "yaxis5"):
+    for axis_name in ("yaxis", "yaxis3", "yaxis5", "yaxis7"):
         domain = getattr(fig.layout, axis_name).domain
         fig.add_annotation(
             x=x_title_date,
@@ -1601,33 +1936,149 @@ def build_dashboard_figure(
 # ---------------------------------------------------------------------------
 
 def build_stddev_control_panel_html(initial_state: dict[str, object], plot_id: str) -> str:
-    """Return custom HTML/JS radio controls for standard-deviation traces."""
+    """Return grouped HTML/JS controls for standard-deviation traces.
+
+    Each graph owns its own complete control set so every switcher affects only
+    the matching graph series. The JavaScript state is keyed by the same
+    graph-owned ``stdGroup`` values used by Plotly trace metadata, which keeps
+    HTML controls, trace visibility, and CLI startup settings aligned.
+    """
     state_json = json.dumps(initial_state)
     return f"""
 <div id="stddev-control-panel" class="stddev-control-panel">
   <div class="stddev-control-title">Std line controls</div>
-  <div class="stddev-control-row">
-    <span class="stddev-control-label">CAPE mode</span>
-    <button type="button" data-std-control="mode" data-group="cape" data-value="raw">Raw</button>
-    <button type="button" data-std-control="mode" data-group="cape" data-value="log">Log</button>
-    <button type="button" data-std-control="toggle" data-group="cape">CAPE Std On/Off</button>
-  </div>
-  <div class="stddev-control-row">
-    <span class="stddev-control-label">Buffett mode</span>
-    <button type="button" data-std-control="mode" data-group="buffett" data-value="raw">Raw</button>
-    <button type="button" data-std-control="mode" data-group="buffett" data-value="log">Log</button>
-    <button type="button" data-std-control="toggle" data-group="buffett">Buffett Std On/Off</button>
-  </div>
-  <div class="stddev-control-row">
-    <span class="stddev-control-label">S&amp;P 500 mode</span>
-    <button type="button" data-std-control="mode" data-group="sp500" data-value="raw">Raw</button>
-    <button type="button" data-std-control="mode" data-group="sp500" data-value="log">Log</button>
-    <button type="button" data-std-control="toggle" data-group="sp500">S&amp;P 500 Std On/Off</button>
-  </div>
-  <div class="stddev-control-row">
-    <span class="stddev-control-label">Std line count</span>
-    <button type="button" data-std-control="lineCount" data-value="4">4 lines</button>
-    <button type="button" data-std-control="lineCount" data-value="8">8 lines</button>
+  <div class="stddev-control-grid">
+    <section class="stddev-control-group">
+      <div class="stddev-control-group-title">Graph 1 · Buffett Indicator + CAPE</div>
+      <div class="stddev-control-metric">
+        <div class="stddev-control-row">
+          <span class="stddev-control-label">CAPE mode</span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="mode" data-group="cape_graph1" data-value="raw">Raw</button>
+            <button type="button" data-std-control="mode" data-group="cape_graph1" data-value="log">Log</button>
+          </div>
+        </div>
+        <div class="stddev-control-row stddev-control-row--toggle">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <button type="button" data-std-control="toggle" data-group="cape_graph1">CAPE Std On/Off</button>
+        </div>
+        <div class="stddev-control-row stddev-control-row--line-count">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="lineCount" data-group="cape_graph1" data-value="4">4 lines</button>
+            <button type="button" data-std-control="lineCount" data-group="cape_graph1" data-value="8">8 lines</button>
+          </div>
+        </div>
+      </div>
+      <div class="stddev-control-metric">
+        <div class="stddev-control-row">
+          <span class="stddev-control-label">Buffett mode</span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="mode" data-group="buffett_graph1" data-value="raw">Raw</button>
+            <button type="button" data-std-control="mode" data-group="buffett_graph1" data-value="log">Log</button>
+          </div>
+        </div>
+        <div class="stddev-control-row stddev-control-row--toggle">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <button type="button" data-std-control="toggle" data-group="buffett_graph1">Buffett Std On/Off</button>
+        </div>
+        <div class="stddev-control-row stddev-control-row--line-count">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="lineCount" data-group="buffett_graph1" data-value="4">4 lines</button>
+            <button type="button" data-std-control="lineCount" data-group="buffett_graph1" data-value="8">8 lines</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="stddev-control-group">
+      <div class="stddev-control-group-title">Graph 2 · S&amp;P 500 + Buffett Indicator</div>
+      <div class="stddev-control-metric">
+        <div class="stddev-control-row">
+          <span class="stddev-control-label">S&amp;P 500 mode</span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="mode" data-group="sp500_graph2" data-value="raw">Raw</button>
+            <button type="button" data-std-control="mode" data-group="sp500_graph2" data-value="log">Log</button>
+          </div>
+        </div>
+        <div class="stddev-control-row stddev-control-row--toggle">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <button type="button" data-std-control="toggle" data-group="sp500_graph2">S&amp;P 500 Std On/Off</button>
+        </div>
+        <div class="stddev-control-row stddev-control-row--line-count">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="lineCount" data-group="sp500_graph2" data-value="4">4 lines</button>
+            <button type="button" data-std-control="lineCount" data-group="sp500_graph2" data-value="8">8 lines</button>
+          </div>
+        </div>
+      </div>
+      <div class="stddev-control-metric">
+        <div class="stddev-control-row">
+          <span class="stddev-control-label">Buffett mode</span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="mode" data-group="buffett_graph2" data-value="raw">Raw</button>
+            <button type="button" data-std-control="mode" data-group="buffett_graph2" data-value="log">Log</button>
+          </div>
+        </div>
+        <div class="stddev-control-row stddev-control-row--toggle">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <button type="button" data-std-control="toggle" data-group="buffett_graph2">Buffett Std On/Off</button>
+        </div>
+        <div class="stddev-control-row stddev-control-row--line-count">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="lineCount" data-group="buffett_graph2" data-value="4">4 lines</button>
+            <button type="button" data-std-control="lineCount" data-group="buffett_graph2" data-value="8">8 lines</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="stddev-control-group">
+      <div class="stddev-control-group-title">Graph 3 · S&amp;P 500 + Shiller CAPE</div>
+      <div class="stddev-control-metric">
+        <div class="stddev-control-row">
+          <span class="stddev-control-label">S&amp;P 500 mode</span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="mode" data-group="sp500_graph3" data-value="raw">Raw</button>
+            <button type="button" data-std-control="mode" data-group="sp500_graph3" data-value="log">Log</button>
+          </div>
+        </div>
+        <div class="stddev-control-row stddev-control-row--toggle">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <button type="button" data-std-control="toggle" data-group="sp500_graph3">S&amp;P 500 Std On/Off</button>
+        </div>
+        <div class="stddev-control-row stddev-control-row--line-count">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="lineCount" data-group="sp500_graph3" data-value="4">4 lines</button>
+            <button type="button" data-std-control="lineCount" data-group="sp500_graph3" data-value="8">8 lines</button>
+          </div>
+        </div>
+      </div>
+      <div class="stddev-control-metric">
+        <div class="stddev-control-row">
+          <span class="stddev-control-label">CAPE mode</span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="mode" data-group="cape_graph3" data-value="raw">Raw</button>
+            <button type="button" data-std-control="mode" data-group="cape_graph3" data-value="log">Log</button>
+          </div>
+        </div>
+        <div class="stddev-control-row stddev-control-row--toggle">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <button type="button" data-std-control="toggle" data-group="cape_graph3">CAPE Std On/Off</button>
+        </div>
+        <div class="stddev-control-row stddev-control-row--line-count">
+          <span class="stddev-control-label stddev-control-label--spacer"></span>
+          <div class="stddev-control-choice-group">
+            <button type="button" data-std-control="lineCount" data-group="cape_graph3" data-value="4">4 lines</button>
+            <button type="button" data-std-control="lineCount" data-group="cape_graph3" data-value="8">8 lines</button>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 </div>
 <style>
@@ -1635,13 +2086,27 @@ def build_stddev_control_panel_html(initial_state: dict[str, object], plot_id: s
     font-family: Arial, sans-serif;
     border: 1px solid #d0d7de;
     border-radius: 8px;
-    padding: 12px 14px;
+    padding: 14px 16px;
     margin: 10px 18px 0 18px;
     background: #f8fafc;
   }}
-  .stddev-control-title {{ font-weight: 700; margin-bottom: 8px; color: #111827; }}
-  .stddev-control-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }}
-  .stddev-control-label {{ width: 120px; font-weight: 600; color: #374151; }}
+  .stddev-control-title {{ font-weight: 700; margin-bottom: 10px; color: #111827; }}
+  .stddev-control-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }}
+  .stddev-control-group {{
+    border: 1px solid #dbe3ee;
+    border-radius: 10px;
+    background: #ffffff;
+    padding: 10px 12px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+  }}
+  .stddev-control-group-title {{ font-weight: 700; color: #1f2937; margin-bottom: 10px; }}
+  .stddev-control-metric + .stddev-control-metric {{ margin-top: 10px; }}
+  .stddev-control-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }}
+  .stddev-control-row + .stddev-control-row {{ margin-top: 6px; }}
+  .stddev-control-row--toggle, .stddev-control-row--line-count {{ padding-left: 0; }}
+  .stddev-control-label {{ min-width: 110px; font-weight: 600; color: #374151; }}
+  .stddev-control-label--spacer {{ visibility: hidden; }}
+  .stddev-control-choice-group {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
   .stddev-control-panel button {{
     border: 1px solid #9ca3af;
     border-radius: 999px;
@@ -1664,13 +2129,17 @@ def build_stddev_control_panel_html(initial_state: dict[str, object], plot_id: s
     return Number(lineCount) === 8 ? [0.5, 1, 1.5, 2] : [1, 2];
   }}
 
+  function lineCountForGroup(group) {{
+    return Number((state.lineCounts || {{}})[group] || 4);
+  }}
+
   function traceShouldShow(trace) {{
     const meta = trace.meta || {{}};
     if (!meta.stdControl) return trace.visible === undefined ? true : trace.visible;
     const group = meta.stdGroup;
     const mode = meta.stdMode;
     const multiplier = Number(meta.stdMultiplier);
-    const allowed = selectedMultipliers(state.lineCount).some(v => Math.abs(v - multiplier) < EPS);
+    const allowed = selectedMultipliers(lineCountForGroup(group)).some(v => Math.abs(v - multiplier) < EPS);
     return Boolean(state.show[group] && state.modes[group] === mode && allowed);
   }}
 
@@ -1682,7 +2151,7 @@ def build_stddev_control_panel_html(initial_state: dict[str, object], plot_id: s
     const group = parts[1];
     const mode = parts[2];
     const multiplier = Number(parts[3]);
-    const allowed = selectedMultipliers(state.lineCount).some(v => Math.abs(v - multiplier) < EPS);
+    const allowed = selectedMultipliers(lineCountForGroup(group)).some(v => Math.abs(v - multiplier) < EPS);
     return Boolean(state.show[group] && state.modes[group] === mode && allowed);
   }}
 
@@ -1693,7 +2162,7 @@ def build_stddev_control_panel_html(initial_state: dict[str, object], plot_id: s
       const value = button.dataset.value;
       button.classList.remove('active', 'toggle-active', 'toggle-inactive');
       if (control === 'mode' && state.modes[group] === value) button.classList.add('active');
-      if (control === 'lineCount' && String(state.lineCount) === String(value)) button.classList.add('active');
+      if (control === 'lineCount' && String(lineCountForGroup(group)) === String(value)) button.classList.add('active');
       if (control === 'toggle') button.classList.add(state.show[group] ? 'toggle-active' : 'toggle-inactive');
     }});
   }}
@@ -1729,7 +2198,7 @@ def build_stddev_control_panel_html(initial_state: dict[str, object], plot_id: s
         const value = button.dataset.value;
         if (control === 'mode') state.modes[group] = value;
         if (control === 'toggle') state.show[group] = !state.show[group];
-        if (control === 'lineCount') state.lineCount = Number(value);
+        if (control === 'lineCount') state.lineCounts[group] = Number(value);
         applyStdControls();
       }});
     }});
@@ -1759,28 +2228,16 @@ def save_dashboard_html(
     output_path: Path,
     figure: go.Figure,
     *,
-    cape_stddev_mode: str,
-    buffett_stddev_mode: str,
-    sp500_stddev_mode: str,
-    stddev_line_count: int,
-    show_cape_std_lines: bool,
-    show_buffett_std_lines: bool,
-    show_sp500_std_lines: bool,
+    stddev_modes: dict[str, str],
+    show_std_lines: dict[str, bool],
+    stddev_line_counts: dict[str, int],
 ) -> None:
-    """Save Plotly HTML with custom JavaScript radio controls for Std lines."""
+    """Save Plotly HTML with per-graph custom controls for Std lines."""
     plot_id = "buffett-dashboard-plot"
     initial_state = {
-        "modes": {
-            "cape": cape_stddev_mode,
-            "buffett": buffett_stddev_mode,
-            "sp500": sp500_stddev_mode,
-        },
-        "show": {
-            "cape": bool(show_cape_std_lines),
-            "buffett": bool(show_buffett_std_lines),
-            "sp500": bool(show_sp500_std_lines),
-        },
-        "lineCount": int(stddev_line_count),
+        "modes": {group: str(value) for group, value in stddev_modes.items()},
+        "show": {group: bool(value) for group, value in show_std_lines.items()},
+        "lineCounts": {group: int(value) for group, value in stddev_line_counts.items()},
     }
     controls = build_stddev_control_panel_html(initial_state, plot_id)
     html = figure.to_html(full_html=True, include_plotlyjs="cdn", div_id=plot_id)
@@ -1821,55 +2278,62 @@ def save_excel_workbook(
 # Main orchestration
 # ---------------------------------------------------------------------------
 
+def add_stddev_cli_group_args(
+    parser: argparse.ArgumentParser,
+    *,
+    arg_prefix: str,
+    label: str,
+    default_mode: str,
+    default_visible: bool,
+    default_line_count: int = 4,
+) -> None:
+    """Register one complete Std-dev CLI control set for a single graph series.
+
+    ``arg_prefix`` is the stable command-line stem (for example ``graph1-cape``).
+    The function adds three arguments that all apply only to that one chart
+    series: initial mode, initial visibility, and initial line-count selector.
+    Centralizing the argument creation keeps the six graph-series definitions
+    consistent and makes it much harder for shared/coupled CLI behavior to creep
+    back into the script in later edits.
+    """
+    parser.add_argument(
+        f"--{arg_prefix}-stddev-mode",
+        choices=["raw", "log"],
+        default=default_mode,
+        help=f"Initial std-dev mode for {label} only: raw mean +/- std or log-residual bands (default: {default_mode}).",
+    )
+    parser.add_argument(
+        f"--{arg_prefix}-std-lines",
+        action=argparse.BooleanOptionalAction,
+        default=default_visible,
+        help=(
+            f"Initial Std line visibility for {label} only "
+            f"(default: {'on' if default_visible else 'off'})."
+        ),
+    )
+    parser.add_argument(
+        f"--{arg_prefix}-stddev-lines",
+        type=int,
+        choices=[4, 8],
+        default=default_line_count,
+        help=f"Initial Std line count for {label} only: 4 = +/-1 and +/-2; 8 also includes +/-0.5 and +/-1.5 (default: {default_line_count}).",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build Buffett/CAPE/Berkshire dashboard and Excel workbook.")
     parser.add_argument("--start", default=DEFAULT_START, help=f"Start date for displayed data (default: {DEFAULT_START})")
     parser.add_argument("--output-dir", default=".", help="Directory where the HTML and Excel files will be saved")
     parser.add_argument("--html-name", default=DEFAULT_OUTPUT_HTML, help=f"HTML file name (default: {DEFAULT_OUTPUT_HTML})")
     parser.add_argument("--excel-name", default=DEFAULT_OUTPUT_XLSX, help=f"Excel file name (default: {DEFAULT_OUTPUT_XLSX})")
-    parser.add_argument(
-        "--cape-stddev-mode",
-        choices=["raw", "log"],
-        default="raw",
-        help="How to draw Shiller CAPE standard-deviation bands: raw mean +/- std or log-residual bands around a trend (default: raw).",
-    )
-    parser.add_argument(
-        "--buffett-stddev-mode",
-        choices=["raw", "log"],
-        default="log",
-        help="How to draw Buffett Indicator standard-deviation bands: raw mean +/- std or log-residual bands around a trend (default: log).",
-    )
-    parser.add_argument(
-        "--sp500-stddev-mode",
-        choices=["raw", "log"],
-        default="raw",
-        help="How to draw S&P 500 standard-deviation bands: raw mean +/- std or log-residual bands around a trend (default: raw).",
-    )
-    parser.add_argument(
-        "--stddev-lines",
-        type=int,
-        choices=[4, 8],
-        default=4,
-        help="Number of standard-deviation lines to draw: 4 = +/-1 and +/-2; 8 also includes +/-0.5 and +/-1.5 (default: 4).",
-    )
-    parser.add_argument(
-        "--cape-std-lines",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Initial display state for CAPE standard-deviation lines (default: on; use --no-cape-std-lines to hide initially).",
-    )
-    parser.add_argument(
-        "--buffett-std-lines",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Initial display state for Buffett Indicator standard-deviation lines (default: on; use --no-buffett-std-lines to hide initially).",
-    )
-    parser.add_argument(
-        "--sp500-std-lines",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Initial display state for S&P 500 standard-deviation lines (default: off; use --sp500-std-lines to show initially).",
-    )
+
+    add_stddev_cli_group_args(parser, arg_prefix="graph1-cape", label="Graph 1 CAPE", default_mode="raw", default_visible=True)
+    add_stddev_cli_group_args(parser, arg_prefix="graph1-buffett", label="Graph 1 Buffett Indicator", default_mode="log", default_visible=True)
+    add_stddev_cli_group_args(parser, arg_prefix="graph2-sp500", label="Graph 2 S&P 500", default_mode="raw", default_visible=False)
+    add_stddev_cli_group_args(parser, arg_prefix="graph2-buffett", label="Graph 2 Buffett Indicator", default_mode="log", default_visible=True)
+    add_stddev_cli_group_args(parser, arg_prefix="graph3-sp500", label="Graph 3 S&P 500", default_mode="raw", default_visible=False)
+    add_stddev_cli_group_args(parser, arg_prefix="graph3-cape", label="Graph 3 CAPE", default_mode="raw", default_visible=True)
+
     parser.add_argument(
         "--user-agent",
         default=os.environ.get("HTTP_USER_AGENT", os.environ.get("SEC_USER_AGENT", "Your Name your.email@example.com")),
@@ -1899,75 +2363,75 @@ def main() -> None:
     log_progress(f"Buffett dataset ready with {len(buffett):,} rows", started_at)
 
     latest_sp500_month_end = latest_complete_month_end()
-    log_progress(f"Latest completed S&P 500 month-end cutoff: {latest_sp500_month_end:%Y-%m-%d}", started_at)
+    log_progress(f"Latest completed S&P 500 month-end cutoff: {latest_sp500_month_end.date()}", started_at)
 
-    log_progress("Downloading Shiller workbook and calculating CAPE series", started_at)
+    log_progress("Downloading latest S&P 500 history from Yahoo Finance", started_at)
+    sp500_yahoo = fetch_yahoo_history("^GSPC", start)
+    if sp500_yahoo.empty:
+        raise RuntimeError("Yahoo Finance returned no usable S&P 500 history for ^GSPC.")
+
+    # Normalize Yahoo output into the dashboard/export schema right away so all
+    # later code paths can rely on a single stable column layout.
+    sp500_yahoo = prepare_sp500_yahoo_frame_for_dashboard(sp500_yahoo)
+    canonical_sp500_cutoff = latest_sp500_month_end.normalize()
+    sp500_yahoo = sp500_yahoo.loc[sp500_yahoo["date"].dt.normalize() <= canonical_sp500_cutoff].copy()
+    sp500_yahoo = prepare_sp500_yahoo_frame_for_dashboard(sp500_yahoo)
+    if sp500_yahoo.empty:
+        raise RuntimeError("Yahoo Finance S&P 500 history did not contain the latest completed month-end after cutoff filtering.")
+    latest_downloaded_sp500_date = sp500_yahoo["date"].max().normalize()
+    if latest_downloaded_sp500_date != canonical_sp500_cutoff:
+        raise RuntimeError(
+            "Yahoo Finance S&P 500 history is missing the latest completed month-end "
+            f"({canonical_sp500_cutoff.date()}); latest available row was {latest_downloaded_sp500_date.date()}."
+        )
+    log_progress(f"S&P 500 history ready through {latest_downloaded_sp500_date.date()} with {len(sp500_yahoo):,} rows", started_at)
+
+    log_progress("Downloading Shiller workbook", started_at)
     shiller = build_shiller_series(session, start)
-    shiller = shiller[shiller["date"] <= latest_sp500_month_end].copy()
     log_progress(f"Shiller dataset ready with {len(shiller):,} rows", started_at)
 
-    log_progress("Downloading dedicated Yahoo S&P 500 monthly series for Excel", started_at)
-    try:
-        sp500_yahoo = fetch_yahoo_history("^GSPC", start=start, interval="1mo").rename(columns={"value": "sp500_yahoo"})
-        sp500_yahoo = sp500_yahoo[sp500_yahoo["date"] <= latest_sp500_month_end].copy()
-        log_progress(f"Yahoo S&P dataset ready with {len(sp500_yahoo):,} rows", started_at)
-    except Exception as exc:
-        log_progress(f"Yahoo S&P download failed ({exc}); falling back to Shiller S&P column", started_at)
-        sp500_yahoo = shiller[["date", "sp500_index"]].rename(columns={"sp500_index": "sp500_yahoo"}).copy()
-        sp500_yahoo = sp500_yahoo[sp500_yahoo["date"] <= latest_sp500_month_end].copy()
-
-    # Add the requested historical mean +/- standard-deviation levels directly
-    # in the dedicated S&P worksheet before the workbook is written.
-    sp500_yahoo = add_stddev_level_columns(
-        sp500_yahoo,
-        source_col="sp500_yahoo",
-        prefix="sp500_yahoo",
-        include_mean=True,
-        floor_at_zero=True,
-    )
-    sp500_yahoo = add_log_trend_stddev_columns(
-        sp500_yahoo,
-        source_col="sp500_yahoo",
-        prefix="sp500_yahoo",
-        include_trend=True,
-    )
-
-    log_progress("Downloading Berkshire history from CompaniesMarketCap only", started_at)
-    brk_bundle = fetch_berkshire_history(session, ticker="BRK-B")
+    log_progress("Downloading Berkshire cash/assets history", started_at)
+    brk_bundle = fetch_berkshire_history(session)
     brk = brk_bundle.merged.copy()
-    log_progress(f"Berkshire merged dataset ready with {len(brk):,} rows", started_at)
+    log_progress(f"Berkshire dataset ready with {len(brk):,} rows", started_at)
 
-    # Apply the enforced 1989-01 minimum cutoff consistently across all exported sheets.
-    cutoff = pd.Timestamp(start)
-    buffett = buffett[buffett["date"] >= cutoff].copy()
-    shiller = shiller[shiller["date"] >= cutoff].copy()
-    sp500_yahoo = sp500_yahoo[sp500_yahoo["date"] >= cutoff].copy()
-    brk_bundle.merged = brk_bundle.merged[brk_bundle.merged["date"] >= cutoff].copy()
-    brk_bundle.cmc_cash = brk_bundle.cmc_cash[brk_bundle.cmc_cash["date"] >= cutoff].copy()
-    brk_bundle.cmc_assets = brk_bundle.cmc_assets[brk_bundle.cmc_assets["date"] >= cutoff].copy()
-    brk_bundle.source_audit = brk_bundle.source_audit[brk_bundle.source_audit["date"] >= cutoff].copy()
-    brk = brk_bundle.merged
-
-    if buffett.empty or shiller.empty or brk.empty or sp500_yahoo.empty:
-        raise RuntimeError("One or more required datasets came back empty. Please check the source endpoints.")
-
-    log_progress("Building combined monthly sheet", started_at)
+    log_progress("Combining monthly datasets for Excel export", started_at)
     combined = build_combined_monthly_sheet(buffett, shiller, brk, sp500_yahoo)
-    log_progress(f"Combined sheet ready with {len(combined):,} rows", started_at)
 
-    log_progress("Rendering Plotly dashboard", started_at)
+    stddev_modes = {
+        "cape_graph1": args.graph1_cape_stddev_mode,
+        "buffett_graph1": args.graph1_buffett_stddev_mode,
+        "sp500_graph2": args.graph2_sp500_stddev_mode,
+        "buffett_graph2": args.graph2_buffett_stddev_mode,
+        "sp500_graph3": args.graph3_sp500_stddev_mode,
+        "cape_graph3": args.graph3_cape_stddev_mode,
+    }
+    show_std_lines = {
+        "cape_graph1": bool(args.graph1_cape_std_lines),
+        "buffett_graph1": bool(args.graph1_buffett_std_lines),
+        "sp500_graph2": bool(args.graph2_sp500_std_lines),
+        "buffett_graph2": bool(args.graph2_buffett_std_lines),
+        "sp500_graph3": bool(args.graph3_sp500_std_lines),
+        "cape_graph3": bool(args.graph3_cape_std_lines),
+    }
+    stddev_line_counts = {
+        "cape_graph1": int(args.graph1_cape_stddev_lines),
+        "buffett_graph1": int(args.graph1_buffett_stddev_lines),
+        "sp500_graph2": int(args.graph2_sp500_stddev_lines),
+        "buffett_graph2": int(args.graph2_buffett_stddev_lines),
+        "sp500_graph3": int(args.graph3_sp500_stddev_lines),
+        "cape_graph3": int(args.graph3_cape_stddev_lines),
+    }
+
+    log_progress("Building Plotly dashboard figure", started_at)
     figure = build_dashboard_figure(
         buffett=buffett,
         shiller=shiller,
         brk=brk,
         sp500_yahoo=sp500_yahoo,
-        cape_stddev_mode=args.cape_stddev_mode,
-        buffett_stddev_mode=args.buffett_stddev_mode,
-        sp500_stddev_mode=args.sp500_stddev_mode,
-        stddev_line_count=args.stddev_lines,
-        show_cape_std_lines=args.cape_std_lines,
-        show_buffett_std_lines=args.buffett_std_lines,
-        show_sp500_std_lines=args.sp500_std_lines,
+        stddev_modes=stddev_modes,
+        show_std_lines=show_std_lines,
+        stddev_line_counts=stddev_line_counts,
     )
 
     html_path = output_dir / args.html_name
@@ -1977,13 +2441,9 @@ def main() -> None:
     save_dashboard_html(
         html_path,
         figure,
-        cape_stddev_mode=args.cape_stddev_mode,
-        buffett_stddev_mode=args.buffett_stddev_mode,
-        sp500_stddev_mode=args.sp500_stddev_mode,
-        stddev_line_count=args.stddev_lines,
-        show_cape_std_lines=args.cape_std_lines,
-        show_buffett_std_lines=args.buffett_std_lines,
-        show_sp500_std_lines=args.sp500_std_lines,
+        stddev_modes=stddev_modes,
+        show_std_lines=show_std_lines,
+        stddev_line_counts=stddev_line_counts,
     )
 
     log_progress("Saving Excel workbook", started_at)
