@@ -45,14 +45,13 @@ Interactive Plotly dashboard with:
 The generated `buffett_dashboard.html` is an interactive Plotly dashboard. The page combines long-term valuation indicators, market index history, Berkshire Hathaway liquidity data, and browser-side controls for showing or hiding statistical reference lines.
 
 ### Full dashboard view
-
-![Main dashboard UI](UI_setting.png)
+<img src="assets/UI_setting.png" width="800" alt="Main dashboard UI">
 
 The full dashboard view shows the custom **Std line controls** panel at the top, followed by the main chart area. The first chart panel compares the **Buffett Indicator** with the **Shiller CAPE ratio** and their standard-deviation reference lines. The legend on the right can be clicked to show or hide each output series.
 
 ### Lower chart panels and hover annotation
 
-![Dashboard chart panels](UI_main.png)
+<img src="assets/UI_main.png" width="800" alt="Dashboard chart panels">
 
 The lower dashboard panels show the **S&P 500 index and Buffett Indicator** together, plus **Berkshire Hathaway cash on hand and total assets** as bar charts. When users hover over a data point or bar, the dashboard displays contextual values such as year, cash/assets percentage, cash amount, and total assets.
 
